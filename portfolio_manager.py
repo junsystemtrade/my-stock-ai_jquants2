@@ -7,12 +7,11 @@ from database_manager import DBManager
 def sync_data():
     """J-Quantsの銘柄リストに基づき、DBの株価データを最新に更新する"""
     db = DBManager()
-    mail = os.getenv("JQUANTS_MAIL")
-    password = os.getenv("JQUANTS_PASSWORD")
     
+    # 環境変数 JQUANTS_MAIL と JQUANTS_PASSWORD が設定されていれば
+    # 引数なしで自動的にログインを試みます
     try:
-        # 引数名を 'mail' から 'user_email' に修正しました
-        cli = jquantsapi.Client(user_email=mail, password=password)
+        cli = jquantsapi.Client() 
         listed_info = cli.get_listed_info()
         tickers = [f"{str(code)[:4]}.T" for code in listed_info['Code']]
     except Exception as e:
