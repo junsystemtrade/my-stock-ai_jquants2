@@ -1,0 +1,27 @@
+name: Manual Backtest Report
+on:
+  workflow_dispatch: # 手動実行のみ（スケジュールなし）
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas yfinance sqlalchemy psycopg2-binary google-generativeai requests
+
+      - name: Execute Backtest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        # backtest_engineを直接呼び出します
+        run: python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
