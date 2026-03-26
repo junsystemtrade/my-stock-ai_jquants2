@@ -1,0 +1,23 @@
+name: Daily Stock Analysis
+on:
+  schedule:
+    - cron: '15 8 * * 1-5' # 平日17:15 JST
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install pandas yfinance sqlalchemy psycopg2-binary jquants-api-client google-generativeai requests
+      - name: Execute
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JQUANTS_MAIL: ${{ secrets.JQUANTS_MAIL }}
+          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python main.py
