@@ -7,34 +7,42 @@ def sync_data():
     db = database_manager.DBManager()
     api_key = os.getenv("JQUANTS_API_KEY")
     
-    # 認証ヘッダー (V2 APIキー用)
-    headers = {"Authorization": f"Bearer {api_key}"}
+    # 【重要】J-Quants V2のAPIキー直接認証は 'x-api-key' ヘッダーを使用します
+    headers = {
+        "x-api-key": api_key,
+        "accept": "application/json"
+    }
     
     try:
-        # 30480 (ビックカメラ) を取得
         target_code = "30480"
-        print(f"🔄 J-Quants V2 からデータ取得中: {target_code}")
+        print(f"🔄 J-Quants V2 (x-api-key) で取得中: {target_code}")
         
+        # 銘柄情報のURL (V2)
         price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}"
-        res_price = requests.get(price_url, headers=headers)
+        res_price = requests.get(price_url, headers=headers, timeout=20)
         
-        # 応答が空でないか、JSONかどうかを厳密にチェック
-        if res_price.status_code == 200 and res_price.text.strip():
-            try:
-                data = res_price.json()
-                quotes = data.get("daily_quotes", [])
-                if quotes:
-                    df = pd.DataFrame(quotes)
-                    df['date'] = pd.to_datetime(df['Date']).dt.date
-                    df['ticker'] = target_code[:4]
-                    df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"})
-                    db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                else:
-                    print("⚠️ 取得データが空です。")
-            except Exception as je:
-                print(f"❌ JSON解析失敗: {je} / Response: {res_price.text[:100]}")
+        if res_price.status_code == 200:
+            data = res_price.json()
+            quotes = data.get("daily_quotes", [])
+            if quotes:
+                df = pd.DataFrame(quotes)
+                df['date'] = pd.to_datetime(df['Date']).dt.date
+                df['ticker'] = target_code[:4]
+                df = df.rename(columns={
+                    "Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"
+                })
+                # DB保存
+                db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
+                print(f"✅ {target_code} の保存に成功しました！")
+            else:
+                print("⚠️ 応答データが空です（市場休業日など）")
         else:
-            print(f"❌ APIエラー: {res_price.status_code} / 内容: {res_price.text}")
+            # 401や403ならAPIキーの設定ミス、302ならリダイレクト（ログイン画面へ）
+            print(f"❌ APIエラー: {res_price.status_code}")
+            print(f"デバッグ応答: {res_price.text[:100]}")
 
     except Exception as e:
-        print(f"❌ 同期エラー: {e}")
+        print(f"❌ システムエラー: {e}")
+
+if __name__ == "__main__":
+    sync_data()
