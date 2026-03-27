@@ -1,41 +1,45 @@
 import os
 import pandas as pd
-import google.generativeai as genai
+from google import genai
 import database_manager
 import requests
 
 def run_backtest_and_report():
-    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    # 最新SDKのクライアント作成
+    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
     
     db = database_manager.DBManager()
-    # 直近30日のデータを取得
     df = db.load_analysis_data(days=30)
     
     if df.empty:
         print("⚠️ データ不足のためレポートをスキップします。")
         return
 
+    # 村田さんの注目銘柄（3048など）を中心に分析
     prompt = f"""
-    以下の株価データを分析し、福岡の投資家・村田さんへ
-    Discord向けの投資レポート（日本語）を作成してください。
+    以下の株価データ（直近30日）を元に、福岡の投資家・村田さんへ
+    Discord向けの投資レポートを日本語で作成してください。
     
     データ概要:
-    {df.head(50).to_string(index=False)}
+    {df.tail(20).to_string(index=False)}
     
-    形式:
+    構成:
     🏛️ **【AI投資顧問：市場分析】**
-    - 今日の概況
-    - 注目銘柄のテクニカル分析
-    - 明日の運用戦略
+    - 本日の注目銘柄（3048 ビックカメラ等）の動き
+    - テクニカル指標（RSI/EMA等）からの示唆
+    - 明日の運用戦略アドバイス
     """
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        
         webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
         if webhook_url:
             requests.post(webhook_url, json={"content": response.text})
-            print("🚀 レポートを送信しました。")
+            print("🚀 Discordへレポートを送信しました！")
     except Exception as e:
         print(f"❌ 分析失敗: {e}")
 
