@@ -7,25 +7,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # google-genai への差し替えと、必要なライブラリ一式を揃えます
-          pip install pandas yfinance sqlalchemy psycopg2-binary jquants-api-client google-genai requests
+          # エラー解決のため google-generativeai を追加
+          pip install pandas yfinance sqlalchemy psycopg2-binary requests google-generativeai google-genai
 
       - name: Execute Backtest
         env:
+          # Supabase接続用（コロン形式に自動補正される前提）
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          JQUANTS_MAIL: ${{ secrets.JQUANTS_MAIL }}
-          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+          # J-Quants V2用の新しいキー
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          # Gemini 2.0分析用
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          # 通知用
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        # backtest_engineを呼び出し
+        # 修正されたエンジンを実行
         run: python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
