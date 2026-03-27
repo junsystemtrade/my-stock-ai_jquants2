@@ -8,13 +8,12 @@ class DBManager:
     def __init__(self):
         if DBManager._engine is None:
             url = os.getenv("DATABASE_URL")
-            # 接続文字列から余計なオプションを排除し、ここで設定
+            # prepare_threshold は connect_args で渡すのが最新の正解です
             DBManager._engine = create_engine(
                 url,
                 pool_pre_ping=True,
                 connect_args={
                     "connect_timeout": 30,
-                    # プーラー利用時に必要な設定をここで渡す
                     "options": "-c prepare_threshold=0"
                 }
             )
@@ -22,9 +21,12 @@ class DBManager:
 
     def save_prices(self, df):
         if df is None or df.empty: return
-        with self.engine.begin() as conn:
-            df.to_sql("daily_prices", conn, if_exists="append", index=False)
-        print(f"✅ DB保存完了: {len(df)}件")
+        try:
+            with self.engine.begin() as conn:
+                df.to_sql("daily_prices", conn, if_exists="append", index=False)
+            print(f"✅ Supabase保存完了: {len(df)}件")
+        except Exception as e:
+            print(f"❌ DB保存失敗: {e}")
 
     def load_analysis_data(self, days=30):
         query = "SELECT * FROM daily_prices ORDER BY date DESC LIMIT 100"
