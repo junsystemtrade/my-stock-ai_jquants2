@@ -10,38 +10,45 @@ def sync_data():
     api_key = os.getenv("JQUANTS_API_KEY")
     headers = {"Authorization": f"Bearer {api_key}"}
     
-    # --- 1. J-Quants V2 APIから日本株データを取得 ---
+    # --- 1. J-Quants V2 APIから日本株を取得 ---
     print("🔍 J-Quants V2 API 接続開始...")
-    # V2の日次株価エンドポイント
-    jq_url = "https://api.jpx-jquants.com/v2/prices/daily"
-    res = requests.get(jq_url, headers=headers)
     
-    if res.status_code == 200:
-        raw_json = res.json()
-        # V2のレスポンス構造に合わせて抽出（構造は公式ドキュメント準拠）
-        jq_list = raw_json.get("daily_prices", [])
+    # V2の正しいエンドポイントURL
+    # ※全銘柄だと重いため、まずはビックカメラ(3048)などの個別指定からテストを推奨
+    jq_url = "https://jpx-jquants.com/api/v2/prices/daily?code=30480" 
+    
+    try:
+        res = requests.get(jq_url, headers=headers, timeout=30)
+        res.raise_for_status()
+        
+        # V2のレスポンスキーは 'daily_quotes' です
+        jq_list = res.json().get("daily_quotes", [])
+        
         if jq_list:
             df_jq = pd.DataFrame(jq_list)
-            # DBカラム名に合わせた整形（ticker, date, price, volume等）
-            # ※J-Quants V2のキー名に合わせて適宜renameしてください
+            # DBのカラム名に合わせてリネーム (例)
+            df_jq = df_jq.rename(columns={
+                "Code": "ticker",
+                "Date": "date",
+                "Close": "price",
+                "Volume": "volume"
+            })
             db.save_prices(df_jq)
-            print(f"✅ J-Quantsから {len(df_jq)} 件保存しました")
-    else:
-        print(f"⚠️ J-Quants V2エラー: {res.status_code} {res.text}")
+            print(f"✅ J-Quants V2から {len(df_jq)} 件保存しました")
+    except Exception as e:
+        print(f"⚠️ J-Quants同期失敗: {e}")
 
-    # --- 2. yfinance から注目銘柄（米国株・日本株個別）を補完 ---
-    # 村田さんのポートフォリオ銘柄
-    target_tickers = ["AAPL", "JMIA", "NU", "3048.T"] 
+    # --- 2. yfinance から米国株（AAPL, JMIA, NU）を補完 ---
+    target_tickers = ["AAPL", "JMIA", "NU"] 
     print(f"🔍 yfinance補完開始: {target_tickers}")
     
     for symbol in target_tickers:
         try:
-            ticker_obj = yf.Ticker(symbol)
-            hist = ticker_obj.history(period="5d") # 直近5日分
+            hist = yf.Ticker(symbol).history(period="2d")
             if not hist.empty:
                 latest = hist.tail(1)
                 df_yf = pd.DataFrame({
-                    "ticker": [symbol.replace(".T", "")],
+                    "ticker": [symbol],
                     "date": [latest.index[0].date()],
                     "price": [float(latest["Close"].values[0])],
                     "volume": [int(latest["Volume"].values[0])]
