@@ -3,20 +3,22 @@ name: Stock AI Sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 * * 1-5' # 平日18時(JST)
+    - cron: '0 9 * * 1-5' # 日本時間18時（平日のみ）
 
 jobs:
   build:
-    runs-on: ubuntu-24.04 # 最新OS
+    runs-on: ubuntu-24.04 # 2026年の標準OS
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12' # 最新Python
+          python-version: '3.12' # 最新の安定版Python
 
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
+          # google-generativeai ではなく最新の google-genai をインストール
           pip install pandas yfinance sqlalchemy psycopg2-binary requests google-genai
 
       - name: Run Sync and Analysis
@@ -26,5 +28,7 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
+          # 1. J-Quants V2からデータを取得してSupabaseへ保存
           python -c "import portfolio_manager; portfolio_manager.sync_data()"
+          # 2. Supabaseからデータを読み込んでGeminiで分析、Discordへ送信
           python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
