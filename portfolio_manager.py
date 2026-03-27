@@ -4,36 +4,32 @@ import yfinance as yf
 import pandas as pd
 import database_manager
 
-def get_id_token():
-    """リフレッシュトークンから一時的なIDトークンを発行する"""
-    refresh_token = os.getenv("JQUANTS_API_KEY")
-    print("🔑 J-Quants 認証中...")
-    # V2の認証エンドポイント
-    auth_url = f"https://jpx-jquants.com/api/v2/token/auth_refresh?refreshtoken={refresh_token}"
-    res = requests.post(auth_url)
-    res.raise_for_status()
-    return res.json().get("idToken")
-
 def sync_data():
     db = database_manager.DBManager()
     
+    # GitHub Secrets: JQUANTS_API_KEY (v2のAPIキー)
+    api_key = os.getenv("JQUANTS_API_KEY")
+    if not api_key:
+        print("❌ JQUANTS_API_KEY が設定されていません。")
+        return
+
+    # V2 APIでは、このヘッダーだけで認証が完結します
+    headers = {"Authorization": f"Bearer {api_key}"}
+    
     try:
-        # 1. IDトークン取得
-        id_token = get_id_token()
-        headers = {"Authorization": f"Bearer {id_token}"}
-        
-        # 2. 銘柄リスト取得
-        print("🔍 上場銘柄リスト取得中...")
+        # 1. 銘柄リスト取得 (V2)
+        print("🔍 J-Quants V2 銘柄リスト取得中...")
         list_url = "https://jpx-jquants.com/api/v2/listed/info"
-        res_list = requests.get(list_url, headers=headers)
-        res_list.raise_for_status()
+        res_list = requests.get(list_url, headers=headers, timeout=20)
         
-        # 3. テスト実行（まずはビックカメラ: 30480）
-        # 全銘柄一括取得も可能ですが、まずは確実に1件保存できるか確認
-        target_code = "30480" 
+        if res_list.status_code != 200:
+            print(f"❌ リスト取得失敗: {res_list.status_code} {res_list.text}")
+            return
+            
+        # 2. テストとして「ビックカメラ(30480)」を同期
+        target_code = "30480"
         print(f"🔄 同期開始: {target_code}")
         
-        # J-Quants V2 価格取得
         price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}"
         res_price = requests.get(price_url, headers=headers)
         
@@ -41,14 +37,20 @@ def sync_data():
             quotes = res_price.json().get("daily_quotes", [])
             if quotes:
                 df = pd.DataFrame(quotes)
+                # V2のカラム名に合わせて処理
                 df['date'] = pd.to_datetime(df['Date']).dt.date
                 df['ticker'] = target_code[:4]
-                df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"})
+                # DBのカラム名(小文字)へリネーム
+                df = df.rename(columns={
+                    "Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"
+                })
                 
-                # DB保存
+                # DB保存実行
                 db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✅ {target_code} 保存完了")
-                
+                print(f"✅ {target_code} のデータをDBへ保存しました。")
+        else:
+            print(f"⚠️ 価格データ取得失敗: {res_price.status_code}")
+
     except Exception as e:
         print(f"❌ 同期エラー: {e}")
 
