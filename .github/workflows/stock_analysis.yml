@@ -1,0 +1,30 @@
+name: Stock AI Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * 1-5' # 平日18時(JST)
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04 # 最新OS
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # 最新Python
+
+      - name: Install dependencies
+        run: |
+          pip install pandas yfinance sqlalchemy psycopg2-binary requests google-genai
+
+      - name: Run Sync and Analysis
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python -c "import portfolio_manager; portfolio_manager.sync_data()"
+          python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
