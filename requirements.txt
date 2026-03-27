@@ -1,0 +1,7 @@
+google-genai
+jquants-api-client
+yfinance
+sqlalchemy
+psycopg2-binary
+pandas
+requests
