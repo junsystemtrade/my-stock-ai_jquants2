@@ -1,6 +1,6 @@
 name: Manual Backtest Report
 on:
-  workflow_dispatch: # 手動実行のみ（スケジュールなし）
+  workflow_dispatch: # 手動実行のみ
 
 jobs:
   run:
@@ -16,12 +16,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas yfinance sqlalchemy psycopg2-binary google-generativeai requests
+          python -m pip install --upgrade pip
+          # google-genai への差し替えと、必要なライブラリ一式を揃えます
+          pip install pandas yfinance sqlalchemy psycopg2-binary jquants-api-client google-genai requests
 
       - name: Execute Backtest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JQUANTS_MAIL: ${{ secrets.JQUANTS_MAIL }}
+          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        # backtest_engineを直接呼び出します
+        # backtest_engineを呼び出し
         run: python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
