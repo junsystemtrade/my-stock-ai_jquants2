@@ -4,15 +4,16 @@ from sqlalchemy import create_engine
 
 class DBManager:
     def __init__(self):
-        db_url = os.getenv("DATABASE_URL")
-        if not db_url:
-            raise ValueError("DATABASE_URL が設定されていません。")
+        # GitHub Secretsから取得
+        raw_url = os.getenv("DATABASE_URL")
+        # 接続文字列がドット形式ならコロン形式に補正（Pooler対策）
+        self.db_url = raw_url.replace("postgres.brhims", "postgres:brhims")
+        self.engine = create_engine(self.db_url)
 
-        self.engine = create_engine(db_url)
+    def save_prices(self, df):
+        if df.empty: return
+        df.to_sql("daily_prices", self.engine, if_exists="append", index=False)
 
-    def insert_price_data(self, df: pd.DataFrame):
-        df.to_sql("prices", self.engine, if_exists="append", index=False)
-
-    def load_analysis_data(self):
-        query = "SELECT * FROM prices ORDER BY date DESC LIMIT 300;"
+    def load_analysis_data(self, days=150):
+        query = f"SELECT * FROM daily_prices WHERE date > CURRENT_DATE - INTERVAL '{days} days' ORDER BY date ASC"
         return pd.read_sql(query, self.engine)
