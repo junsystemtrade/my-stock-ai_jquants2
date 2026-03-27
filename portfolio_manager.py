@@ -8,45 +8,36 @@ def sync_data():
     db = database_manager.DBManager()
     api_key = os.getenv("JQUANTS_API_KEY")
     
+    # 2026年V2仕様：x-api-key のみで、他の余計な情報を排除
     headers = {
         "x-api-key": api_key,
         "accept": "application/json"
     }
     
     try:
-        target_code = "30480" # ビックカメラ
-        # Freeプランでも確実に取れる「3日前〜昨日」の範囲を指定
-        end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        target_code = "30480"
+        # 確実にFreeプランで許可されている「1週間前」を指定
+        test_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
         
-        print(f"🚀 J-Quants V2 (Free) 取得開始: {target_code} ({start_date} ~ {end_date})")
+        print(f"🕵️ サーバーの正体を暴きます (Key: {api_key[:5]}...)")
+        price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}&from={test_date}&to={test_date}"
         
-        # Freeプランの制約を回避するため、from/to パラメータを付与
-        price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}&from={start_date}&to={end_date}"
+        # あえてリダイレクトを許可し、何が返ってくるか見る
+        res = requests.get(price_url, headers=headers, timeout=20)
         
-        # allow_redirects=False でログイン画面への逃げを封じる
-        res = requests.get(price_url, headers=headers, timeout=20, allow_redirects=False)
-        
+        print(f"📡 ステータスコード: {res.status_code}")
+        print(f"📡 応答内容（先頭200文字）: \n{res.text[:200]}")
+
+        # ここで強引にJSON解析を試みる
         if res.status_code == 200:
-            data = res.json()
-            quotes = data.get("daily_quotes", [])
-            if quotes:
-                df = pd.DataFrame(quotes)
-                df['date'] = pd.to_datetime(df['Date']).dt.date
-                df['ticker'] = target_code[:4]
-                df = df.rename(columns={
-                    "Open": "open", "High": "high", "Low": "low", 
-                    "Close": "price", "Volume": "volume"
-                })
-                
-                db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✨ 保存完了！{len(df)}件の過去データを格納しました。")
-            else:
-                print(f"⚠️ 期間内({start_date}〜)にデータがありません。")
-        elif res.status_code in [301, 302]:
-            print(f"❌ 認証拒否: 最新データへのアクセス権限がないためリダイレクトされました。")
-        else:
-            print(f"❌ APIエラー {res.status_code}: {res.text[:100]}")
+            try:
+                data = res.json()
+                print("✅ 奇跡的にJSON解析に成功しました！")
+            except:
+                print("❌ JSONではありません。上記HTMLの中にエラー理由が書いてあるはずです。")
 
     except Exception as e:
-        print(f"❌ 同期エラー詳細: {e}")
+        print(f"❌ 通信エラー: {e}")
+
+if __name__ == "__main__":
+    sync_data()
