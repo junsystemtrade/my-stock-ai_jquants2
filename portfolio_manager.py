@@ -7,12 +7,7 @@ def sync_data():
     db = database_manager.DBManager()
     api_key = os.getenv("JQUANTS_API_KEY")
     
-    if not api_key:
-        print("❌ JQUANTS_API_KEY が設定されていません。")
-        return
-
-    # V2公式推奨：x-api-key ヘッダーを使用
-    # AuthorizationヘッダーはV1の名残なので、V2ではこちらが優先されます
+    # 2026年V2仕様：x-api-keyヘッダーに直接セット
     headers = {
         "x-api-key": api_key,
         "accept": "application/json"
@@ -20,12 +15,12 @@ def sync_data():
     
     try:
         target_code = "30480" # ビックカメラ
-        print(f"🔄 J-Quants V2 (API Key方式) 取得開始: {target_code}")
+        print(f"🚀 J-Quants V2 接続開始 (Key: {api_key[:5]}...)")
         
         # V2エンドポイント
         price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}"
         
-        # リダイレクトを明示的に禁止 (ログイン画面へ飛ばさない)
+        # 認証が正しければ、ここで200 OKとJSONが返ります
         res = requests.get(price_url, headers=headers, timeout=20, allow_redirects=False)
         
         if res.status_code == 200:
@@ -33,7 +28,7 @@ def sync_data():
             quotes = data.get("daily_quotes", [])
             if quotes:
                 df = pd.DataFrame(quotes)
-                # V2のカラム名（Date, Open, High, Low, Close, Volume）
+                # V2のカラム名をDB用に変換
                 df['date'] = pd.to_datetime(df['Date']).dt.date
                 df['ticker'] = target_code[:4]
                 df = df.rename(columns={
@@ -42,14 +37,15 @@ def sync_data():
                 })
                 
                 db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✅ {target_code} の保存に成功しました！")
+                print(f"✨ {target_code} のデータをSupabaseへ格納しました！")
             else:
-                print("⚠️ 取得データが空です。")
-        elif res.status_code in [301, 302]:
-            # ここでログイン画面に飛ばそうとしているなら、APIキー自体がサーバーに拒否されています
-            print(f"❌ 認証拒否: APIキーがV2として認識されていません。リダイレクト先: {res.headers.get('Location')}")
+                print("⚠️ データが空です（市場休業日など）")
         else:
-            print(f"❌ APIエラー: {res.status_code} / 応答内容: {res.text[:100]}")
+            print(f"❌ 認証エラー({res.status_code}): キーが反映されていないか、プラン制限の可能性があります。")
+            print(f"詳細: {res.text[:100]}")
 
     except Exception as e:
-        print(f"❌ 同期エラー: {e}")
+        print(f"❌ システムエラー: {e}")
+
+if __name__ == "__main__":
+    sync_data()
