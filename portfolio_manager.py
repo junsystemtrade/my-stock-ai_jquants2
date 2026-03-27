@@ -1,32 +1,20 @@
 import os
 import requests
-import yfinance as yf
 import pandas as pd
 import database_manager
 
 def sync_data():
     db = database_manager.DBManager()
-    
-    # GitHub Secrets: JQUANTS_API_KEY (v2のAPIキー)
     api_key = os.getenv("JQUANTS_API_KEY")
-    if not api_key:
-        print("❌ JQUANTS_API_KEY が設定されていません。")
-        return
-
-    # V2 APIでは、このヘッダーだけで認証が完結します
     headers = {"Authorization": f"Bearer {api_key}"}
     
     try:
-        # 1. 銘柄リスト取得 (V2)
+        # 銘柄リスト取得
         print("🔍 J-Quants V2 銘柄リスト取得中...")
         list_url = "https://jpx-jquants.com/api/v2/listed/info"
         res_list = requests.get(list_url, headers=headers, timeout=20)
         
-        if res_list.status_code != 200:
-            print(f"❌ リスト取得失敗: {res_list.status_code} {res_list.text}")
-            return
-            
-        # 2. テストとして「ビックカメラ(30480)」を同期
+        # 銘柄 30480 (ビックカメラ) の取得
         target_code = "30480"
         print(f"🔄 同期開始: {target_code}")
         
@@ -34,25 +22,18 @@ def sync_data():
         res_price = requests.get(price_url, headers=headers)
         
         if res_price.status_code == 200:
-            quotes = res_price.json().get("daily_quotes", [])
+            data = res_price.json() # ここでエラーが出る場合、中身をプリント
+            quotes = data.get("daily_quotes", [])
             if quotes:
                 df = pd.DataFrame(quotes)
-                # V2のカラム名に合わせて処理
                 df['date'] = pd.to_datetime(df['Date']).dt.date
                 df['ticker'] = target_code[:4]
-                # DBのカラム名(小文字)へリネーム
-                df = df.rename(columns={
-                    "Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"
-                })
+                df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"})
                 
-                # DB保存実行
                 db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✅ {target_code} のデータをDBへ保存しました。")
+                print(f"✅ {target_code} 保存完了")
         else:
-            print(f"⚠️ 価格データ取得失敗: {res_price.status_code}")
+            print(f"❌ APIエラー: {res_price.status_code} - {res_price.text}")
 
     except Exception as e:
-        print(f"❌ 同期エラー: {e}")
-
-if __name__ == "__main__":
-    sync_data()
+        print(f"❌ 同期処理中に例外発生: {e}")
