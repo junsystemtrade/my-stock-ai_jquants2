@@ -1,33 +1,33 @@
-name: Stock AI Pipeline
+name: Daily Stock AI Analysis
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 毎日0時に実行
+    - cron: '0 10 * * 1-5' # 平日19時（日本時間）
   workflow_dispatch:
 
 jobs:
-  run:
+  build-and-run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas yfinance sqlalchemy psycopg2-binary requests google-generativeai google-genai
 
-      - name: Run pipeline
+      - name: Execute AI Analysis
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python run_pipeline.py
+          python -c "import portfolio_manager; portfolio_manager.sync_data()"
+          python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
