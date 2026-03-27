@@ -8,7 +8,7 @@ class DBManager:
     def __init__(self):
         if DBManager._engine is None:
             url = os.getenv("DATABASE_URL")
-            # postgres.brhims... の形式になっているか確認してください
+            # プーラー接続用の安定設定
             DBManager._engine = create_engine(
                 url,
                 pool_pre_ping=True,
@@ -23,3 +23,13 @@ class DBManager:
         if df is None or df.empty: return
         with self.engine.begin() as conn:
             df.to_sql("daily_prices", conn, if_exists="append", index=False)
+        print(f"✅ DB保存完了: {len(df)}件")
+
+    # ❗ここが抜けていたので追加しました
+    def load_analysis_data(self, days=30):
+        query = f"SELECT * FROM daily_prices WHERE date > CURRENT_DATE - INTERVAL '{days} days' ORDER BY date ASC"
+        try:
+            return pd.read_sql(query, self.engine)
+        except Exception as e:
+            print(f"⚠️ データ取得失敗（初回は正常）: {e}")
+            return pd.DataFrame()
