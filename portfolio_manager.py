@@ -7,7 +7,7 @@ def sync_data():
     db = database_manager.DBManager()
     api_key = os.getenv("JQUANTS_API_KEY")
     
-    # 【重要】J-Quants V2のAPIキー直接認証は 'x-api-key' ヘッダーを使用します
+    # J-Quants V2 API: APIキーを直接使う場合の標準ヘッダー
     headers = {
         "x-api-key": api_key,
         "accept": "application/json"
@@ -15,34 +15,27 @@ def sync_data():
     
     try:
         target_code = "30480"
-        print(f"🔄 J-Quants V2 (x-api-key) で取得中: {target_code}")
+        print(f"🔄 J-Quants V2 取得開始: {target_code}")
         
-        # 銘柄情報のURL (V2)
+        # allow_redirects=False にして、勝手にログイン画面に飛ばないように監視
         price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}"
-        res_price = requests.get(price_url, headers=headers, timeout=20)
+        res = requests.get(price_url, headers=headers, timeout=20, allow_redirects=False)
         
-        if res_price.status_code == 200:
-            data = res_price.json()
+        if res.status_code == 200:
+            data = res.json()
             quotes = data.get("daily_quotes", [])
             if quotes:
                 df = pd.DataFrame(quotes)
                 df['date'] = pd.to_datetime(df['Date']).dt.date
                 df['ticker'] = target_code[:4]
-                df = df.rename(columns={
-                    "Open": "open", "High": "high", "Low": "low", "Close": "price", "Volume": "volume"
-                })
-                # DB保存
+                df = df.rename(columns={"Open":"open", "High":"high", "Low":"low", "Close":"price", "Volume":"volume"})
                 db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✅ {target_code} の保存に成功しました！")
             else:
-                print("⚠️ 応答データが空です（市場休業日など）")
+                print("⚠️ データが空です。")
+        elif res.status_code in [301, 302]:
+            print(f"❌ 認証失敗: ログイン画面({res.headers.get('Location')})へリダイレクトされました。APIキーを確認してください。")
         else:
-            # 401や403ならAPIキーの設定ミス、302ならリダイレクト（ログイン画面へ）
-            print(f"❌ APIエラー: {res_price.status_code}")
-            print(f"デバッグ応答: {res_price.text[:100]}")
+            print(f"❌ APIエラー: {res.status_code} / {res.text}")
 
     except Exception as e:
-        print(f"❌ システムエラー: {e}")
-
-if __name__ == "__main__":
-    sync_data()
+        print(f"❌ 同期エラー詳細: {e}")
