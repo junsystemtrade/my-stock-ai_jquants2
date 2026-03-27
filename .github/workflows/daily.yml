@@ -3,7 +3,7 @@ on:
   schedule:
     # 平日（月-金）の日本時間 17:15 に実行（UTC 08:15）
     - cron: '15 8 * * 1-5'
-  workflow_dispatch: # テスト用に手動ボタンも残しておきます
+  workflow_dispatch: # 手動実行用
 
 jobs:
   run:
@@ -19,7 +19,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas yfinance sqlalchemy psycopg2-binary jquants-api-client google-generativeai requests
+          python -m pip install --upgrade pip
+          # 【重要】google-genai を含め、最新のライブラリ一式をインストール
+          pip install pandas yfinance sqlalchemy psycopg2-binary jquants-api-client google-genai requests
 
       - name: Run Daily Analysis
         env:
@@ -28,14 +30,18 @@ jobs:
           JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        # main.pyのバックテスト部分を動かさないように制御します
         run: |
           python -c "
           import portfolio_manager, signal_engine, database_manager, requests, os;
+          # 1. データの同期（J-Quants -> DB）
           portfolio_manager.sync_data();
+          
+          # 2. シグナル分析とAIインサイト生成
           db = database_manager.DBManager();
           daily_data = db.load_analysis_data(days=150);
           signals = signal_engine.scan_signals(daily_data);
+          
+          # 3. Discordへの通知
           if signals:
               report = '🏛️ **【AI投資顧問：銘柄検知速報】**\n';
               for s in signals:
