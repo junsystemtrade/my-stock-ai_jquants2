@@ -11,72 +11,49 @@ def sync_data():
     if not api_key:
         raise RuntimeError("JQUANTS_API_KEY が設定されていません")
 
-    # J-Quants V2 デイリーバー（日足）エンドポイント
     base_url = "https://api.jquants.com/v2/equities/bars/daily"
-    headers = {
-        "x-api-key": api_key,
-        "Accept": "application/json",
-    }
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
 
-    # ✅ 銘柄コード: 30480 (ビックカメラ)
+    # 🎯 J-Quants 正式コード（5桁）とテスト用日付
     code = "30480"
+    target_date = "20251201" # 運用時は (date.today() - timedelta(days=1)).strftime("%Y%m%d")
 
-    # 🚀 修正ポイント: J-Quants V2 では日付にハイフンが必要です (YYYY-MM-DD)
-    today_str = date.today().strftime("%Y-%m-%d")
-    from_str = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
-
-    params = {
-        "code": code,
-        "from": from_str,
-        "to": today_str
-    }
-
-    print(f"🎯 J-Quants V2 データ抽出開始: {code} ({from_str} ～ {today_str})")
+    print(f"🎯 J-Quants V2 データ抽出開始: {code}")
 
     try:
-        res = requests.get(
-            base_url,
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
-        # エラー時にレスポンス内容を表示するように強化
-        if res.status_code != 200:
-            print(f"❌ APIエラー詳細: {res.text}")
-        
+        res = requests.get(base_url, headers=headers, params={"code": code, "date": target_date}, timeout=20)
         res.raise_for_status()
 
         raw_data = res.json()
-        quotes = raw_data.get("data", [])
+        quotes = raw_data.get("data", []) # V2は 'data' キー
 
         if not quotes:
-            print(f"⚠️ 取得されたデータが空でした。")
+            print(f"⚠️ データが空でした: {raw_data}")
             return
 
         df = pd.DataFrame(quotes)
 
-        # ✅ 日付と銘柄コードの整形
+        # カラム名変換（V2の揺れをすべて吸収）
         df["date"] = pd.to_datetime(df["Date"]).dt.date
         df["ticker"] = code
 
-        # ✅ カラム名の揺れを吸収
         COLUMN_MAP = {
             "O": "open", "H": "high", "L": "low", "Low": "low", "C": "price", "Vo": "volume"
         }
-        df = df.rename(
-            columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns}
-        )
+        df = df.rename(columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns})
 
+        # 必須カラムの存在チェック
         required_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-        df = df.drop_duplicates(subset=["ticker", "date"])
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"必要なカラムが不足しています: {missing}")
 
-        # ✅ 保存
+        # 重複排除して保存
+        df = df.drop_duplicates(subset=["ticker", "date"])
         db.save_prices(df[required_cols])
-        print(f"✨ {code} の過去30日分のデータを Supabase へ同期完了しました！")
+        
+        print("✨【完遂】J-Quants から Supabase への同期が完了しました")
 
     except Exception as e:
         print(f"❌ 実行エラー: {e}")
         raise
-
-if __name__ == "__main__":
-    sync_data()
