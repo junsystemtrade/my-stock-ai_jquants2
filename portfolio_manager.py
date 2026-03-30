@@ -54,29 +54,40 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------
 def _find_latest_trading_date_str(api_key: str, lookback_days: int = 30) -> str:
     """
-    ディレイを考慮し、実際にデータが取得できる最新の営業日を特定する
+    429エラーを回避するため、慎重に最新営業日を探索する
     """
-    # 念のため昨日から探索開始
     d = date.today() - timedelta(days=1)
     url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
 
-    print(f"🔍 データが存在する最新営業日を探索中 (起点: {d})...")
+    print(f"🔍 429回避モードで最新営業日を探索中 (起点: {d})...")
 
     for _ in range(lookback_days):
         if d.weekday() >= 5: # 土日はスキップ
             d -= timedelta(days=1)
             continue
             
-        # V2ではハイフン付き YYYY-MM-DD が確実
         date_str = d.strftime("%Y-%m-%d")
+        
+        # 💡 戦略的待機: API制限に触れないよう、リクエスト前に1.5秒休む
+        time.sleep(1.5)
+        
         try:
             r = requests.get(url, headers=_headers(api_key), params={"date": date_str}, timeout=20)
+            
             if r.status_code == 200:
                 print(f"✨ ヒットしました: {date_str}")
                 return date_str
+            
             print(f"  - {date_str}: {r.status_code}")
+            
+            if r.status_code == 429:
+                print("⏳ レート制限(429)を検知。ペナルティ解除のため60秒待機します...")
+                time.sleep(60.0)
+                # 429が出た日はカウントせず、もう一度同じ日からリトライさせる
+                continue
+
         except Exception as e:
-            print(f"  - {date_str}: エラー {e}")
+            print(f"  - {date_str}: 通信エラー {e}")
         
         d -= timedelta(days=1)
     
@@ -92,10 +103,16 @@ def _fetch_all_issues_for_date(api_key: str, date_str: str) -> list[dict]:
         if pagination_key:
             params["pagination_key"] = pagination_key
 
+        # 💡 ページネーション時も慎重に待機
+        time.sleep(1.5)
+        
         r = requests.get(url, headers=_headers(api_key), params=params, timeout=30)
+        
         if r.status_code == 429:
-            time.sleep(30)
+            print("⏳ [Pagination] 429検知。60秒待機...")
+            time.sleep(60.0)
             continue
+            
         r.raise_for_status()
         
         payload = r.json()
@@ -104,7 +121,7 @@ def _fetch_all_issues_for_date(api_key: str, date_str: str) -> list[dict]:
         
         if not pagination_key:
             break
-        time.sleep(0.3)
+            
     return rows
 
 # ---------------------------
@@ -114,7 +131,7 @@ def sync_data():
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
     db = database_manager.DBManager()
     
-    print("🚀 データ同期エンジン起動")
+    print("🚀 データ同期エンジン起動 (低速・安定モード)")
 
     # 1. Bulk API への挑戦
     try:
@@ -128,47 +145,52 @@ def sync_data():
             print("🎉 Bulk同期完了")
             return
     except Exception as e:
-        print(f"⚠️ Bulk利用不可 (ステータス: {e})。Daily APIへ切り替えます。")
+        print(f"⚠️ Bulk利用不可。Daily APIへ切り替えます。")
 
     # 2. Daily API による地道なバックフィル
-    latest_date_str = _find_latest_trading_date_str(api_key)
-    current_d = pd.to_datetime(latest_date_str).date()
-    
-    print(f"📅 Dailyルート: {latest_date_str} から過去へ遡ります")
-
-    # Actionsの制限時間を考慮し、とりあえず直近30日分を目指す（調整可能）
-    for _ in range(30):
-        d_str = current_d.strftime("%Y-%m-%d")
-        print(f"📥 {d_str} の全銘柄データを取得中...")
+    try:
+        latest_date_str = _find_latest_trading_date_str(api_key)
+        current_d = pd.to_datetime(latest_date_str).date()
         
-        try:
-            rows = _fetch_all_issues_for_date(api_key, d_str)
-            if rows:
-                df = pd.DataFrame(rows)
-                df["date"] = pd.to_datetime(df["Date"]).dt.date
-                df["ticker"] = df["Code"].astype(str)
-                
-                col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
-                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-                
-                target_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-                db.save_prices(df[target_cols].drop_duplicates())
-                print(f"✅ {len(df)} 件保存完了")
-            else:
-                print(f"⚠️ {d_str}: データがありませんでした")
-        except Exception as e:
-            if "400" in str(e):
-                print(f"⛔ {d_str}: 取得限界に達した可能性があります。")
-                break
-            print(f"❌ {d_str} でエラー: {e}")
+        print(f"📅 Dailyルート: {latest_date_str} から遡って取得を開始します")
 
-        current_d -= timedelta(days=1)
-        # 土日を飛ばす
-        while current_d.weekday() >= 5:
+        # GitHub Actionsの制限(6時間)を考慮しつつ、まずは直近30営業日分
+        for _ in range(30):
+            d_str = current_d.strftime("%Y-%m-%d")
+            print(f"📥 {d_str} の全銘柄データを取得中...")
+            
+            try:
+                rows = _fetch_all_issues_for_date(api_key, d_str)
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df["date"] = pd.to_datetime(df["Date"]).dt.date
+                    df["ticker"] = df["Code"].astype(str)
+                    
+                    col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
+                    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                    
+                    target_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+                    db.save_prices(df[target_cols].drop_duplicates())
+                    print(f"✅ {len(df)} 件保存完了")
+                else:
+                    print(f"⚠️ {d_str}: データなし")
+            except Exception as e:
+                if "400" in str(e):
+                    print(f"⛔ {d_str}: 取得限界(プラン上限)に達しました。")
+                    break
+                print(f"❌ {d_str} でエラー: {e}")
+
             current_d -= timedelta(days=1)
-        time.sleep(1)
+            while current_d.weekday() >= 5:
+                current_d -= timedelta(days=1)
+            
+            # 日付切り替え時も一息つく
+            time.sleep(2.0)
 
-    print("✨ 全工程終了")
+    except RuntimeError as e:
+        print(f"❌ 致命的なエラー: {e}")
+
+    print("✨ 全工程終了。お疲れ様でした！")
 
 if __name__ == "__main__":
     sync_data()
