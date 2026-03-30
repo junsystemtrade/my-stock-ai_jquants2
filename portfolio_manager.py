@@ -1,49 +1,91 @@
 import os
 import requests
 import pandas as pd
+from datetime import date, timedelta
 import database_manager
+
 
 def sync_data():
     db = database_manager.DBManager()
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    
-    # 🎯 クイックスタートで判明した正しいエンドポイント
+
+    if not api_key:
+        raise RuntimeError("JQUANTS_API_KEY が設定されていません")
+
     base_url = "https://api.jquants.com/v2/equities/bars/daily"
-    headers = {"x-api-key": api_key, "Accept": "application/json"}
-    
-    # テスト銘柄: 30480 (ビックカメラ)
-    params = {"code": "30480", "date": "20251201"}
-    
-    print(f"🎯 J-Quants V2 データ抽出開始: {params['code']}")
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+    }
+
+    # ✅ J-Quants 正式コード（5桁）
+    code = "30480"
+
+    # ✅ 前営業日相当（最低限の安全策）
+    target_date = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+
+    params = {
+        "code": code,
+        "date": target_date,
+    }
+
+    print(f"🎯 J-Quants V2 データ抽出開始: {code} / {target_date}")
 
     try:
-        res = requests.get(base_url, headers=headers, params=params, timeout=20)
-        
-        if res.status_code == 200:
-            raw_data = res.json()
-            # ❗重要: 'bars' ではなく 'data' キーから取得します
-            quotes = raw_data.get("data", [])
-            
-            if quotes:
-                df = pd.DataFrame(quotes)
-                
-                # J-Quants V2 (data形式) のカラム名をDB用に変換
-                df['date'] = pd.to_datetime(df['Date']).dt.date
-                df['ticker'] = "3048"
-                df = df.rename(columns={
-                    "O": "open", "H": "high", "Low": "low", # Lの場合もあり
-                    "C": "price", "Vo": "volume"
-                })
-                # 万が一 'L' が 'low' になっていない場合の補完
-                if 'L' in df.columns: df = df.rename(columns={"L": "low"})
-                
-                # Supabaseに保存！
-                db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✨【完全勝利】Supabaseへの保存に成功しました！")
-            else:
-                print(f"⚠️ データが空でした。レスポンス: {raw_data}")
-        else:
-            print(f"❌ 通信エラー: {res.status_code}")
+        res = requests.get(
+            base_url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+        res.raise_for_status()
+
+        raw_data = res.json()
+        quotes = raw_data.get("data", [])
+
+        if not quotes:
+            print(f"⚠️ データが空でした: {raw_data}")
+            return
+
+        df = pd.DataFrame(quotes)
+
+        # ✅ 日付・銘柄コード
+        df["date"] = pd.to_datetime(df["Date"]).dt.date
+        df["ticker"] = code
+
+        # ✅ カラム名の揺れを吸収
+        COLUMN_MAP = {
+            "O": "open",
+            "H": "high",
+            "L": "low",
+            "Low": "low",
+            "C": "price",
+            "Vo": "volume",
+        }
+        df = df.rename(
+            columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns}
+        )
+
+        required_cols = [
+            "ticker",
+            "date",
+            "open",
+            "high",
+            "low",
+            "price",
+            "volume",
+        ]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"必要なカラムが不足しています: {missing}")
+
+        # ✅ 重複防止（最低限）
+        df = df.drop_duplicates(subset=["ticker", "date"])
+
+        # ✅ 保存
+        db.save_prices(df[required_cols])
+        print("✨ Supabaseへの保存が完了しました")
 
     except Exception as e:
         print(f"❌ 実行エラー: {e}")
+        raise
