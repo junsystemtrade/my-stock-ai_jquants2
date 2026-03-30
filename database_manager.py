@@ -1,20 +1,18 @@
 import os
 import pandas as pd
 from sqlalchemy import create_engine
-from datetime import date, timedelta
-
 
 class DBManager:
     def __init__(self):
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
             raise RuntimeError("DATABASE_URL が設定されていません")
-
-        # psycopg2 + Supabase 用の安定構成
+        # 接続の安定性を高める設定
         self.engine = create_engine(db_url)
 
     def save_prices(self, df: pd.DataFrame):
         try:
+            # PostgreSQLへの一括保存
             df.to_sql(
                 "daily_prices",
                 self.engine,
@@ -29,31 +27,45 @@ class DBManager:
 
     def load_analysis_data(self, days: int = 30) -> pd.DataFrame:
         """
-        直近 N 日分のデータを取得する（営業日ベース）
+        DB内の最新日を基準に、安全なバインド変数を用いて直近 N 日分を取得する
         """
-        start_date = date.today() - timedelta(days=days)
-
+        # ✅ 修正①: f-string を廃止し、%(days)s によるバインド変数化
+        # ✅ 修正②: キャスト (::date) により型安全を確保
         query = """
-            SELECT *
-            FROM daily_prices
-            WHERE date >= %(start_date)s
-            ORDER BY date ASC
+            WITH latest AS (
+                SELECT MAX(date::date) AS max_date
+                FROM daily_prices
+            )
+            SELECT 
+                p.ticker,
+                p.date::date AS date,
+                p.open,
+                p.high,
+                p.low,
+                p.price,
+                p.volume
+            FROM daily_prices p
+            CROSS JOIN latest l
+            WHERE p.date::date >= (l.max_date - (INTERVAL '1 day' * %(days)s))
+            ORDER BY p.date::date ASC
+            LIMIT %(days)s
         """
 
         try:
+            # ✅ params 引数で安全に値を渡す
             df = pd.read_sql(
                 query,
                 self.engine,
-                params={"start_date": start_date},
+                params={"days": days},
             )
 
-            if not df.empty:
-                print(f"📖 DBから {len(df)} 件のデータをロードしました。")
-            else:
+            if df.empty:
                 print("⚠️ DBに該当期間のデータが存在しません。")
+            else:
+                print(f"📖 DBから最新日基準で {len(df)} 件のデータを安全にロードしました。")
 
             return df
-
         except Exception as e:
             print(f"⚠️ データ読み込みエラー: {e}")
+            # エラー時は空のDataFrameを返し、後続のレポート処理を安全にスキップさせる
             return pd.DataFrame()
