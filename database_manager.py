@@ -4,28 +4,27 @@ from sqlalchemy import create_engine
 
 class DBManager:
     def __init__(self):
-        # GitHub Secrets の最新URL（aws-1-ap...）を読み込み
         db_url = os.getenv("DATABASE_URL")
         
+        # ❗重要：URLにオプションを付けず、engine作成時に直接指定します
         self.engine = create_engine(
             db_url,
-            pool_pre_ping=True,
-            # ❗これが6543ポート(PgBouncer)でエラーを出さないための必須設定
             connect_args={
-                "prepare_threshold": 0 
+                # これが psycopg2 に prepare_threshold を正しく認識させる書き方です
+                "prepare_threshold": 0
             }
         )
 
     def save_prices(self, df):
-        """J-Quantsのデータを保存"""
         try:
+            # 既にデータがあるかもしれないので append で追加
             df.to_sql('daily_prices', self.engine, if_exists='append', index=False)
-            print("✅ Supabase(6543)への格納に成功しました！")
+            print("✅ Supabase(6543)へのデータ格納に成功しました！")
         except Exception as e:
             print(f"❌ DB保存エラー: {e}")
 
     def load_analysis_data(self, days=30):
-        """Gemini分析用にデータを読み出す"""
+        # 最後に保存されたデータを確認
         query = "SELECT * FROM daily_prices ORDER BY date DESC LIMIT 100"
         try:
             df = pd.read_sql(query, self.engine)
