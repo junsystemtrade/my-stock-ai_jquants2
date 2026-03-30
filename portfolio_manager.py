@@ -6,45 +6,53 @@ import database_manager
 
 def sync_data():
     db = database_manager.DBManager()
-    # キーを読み込み、前後の空白を完全に除去
+    # キーの前後空白を徹底排除
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
     
-    if not api_key:
-        print("❌ APIキーが設定されていません。")
-        return
-
-    print(f"🔑 使用中のAPIキー(先頭5文字): {api_key[:5]}")
-    
     headers = {
-        "x-api-key": api_key, 
+        "x-api-key": api_key,
         "accept": "application/json"
     }
     
-    # ターゲット: 3048 (ビックカメラ) / 3月23日
-    target_date = "2026-03-23"
-    url = f"https://jpx-jquants.com/api/v2/prices/daily?code=3048&from={target_date}&to={target_date}"
-    
     try:
-        # allow_redirects=False で "/ja" への逃げを封鎖
-        res = requests.get(url, headers=headers, timeout=20, allow_redirects=False)
+        # ❗最重要修正: 30480 ではなく 3048 (4桁) にします
+        target_code = "3048" 
         
-        print(f"📡 HTTPステータス: {res.status_code}")
+        # Freeプランでも確実に権限がある「2週間前」の1日分だけをテスト
+        test_date = "2026-03-10"
+        
+        print(f"🎯 J-Quants V2 ターゲット修正: {target_code} (Date: {test_date})")
+        
+        # V2エンドポイント
+        price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}&from={test_date}&to={test_date}"
+        
+        # リダイレクトを許さず、生の内容を確認
+        res = requests.get(price_url, headers=headers, timeout=20, allow_redirects=False)
         
         if res.status_code == 200:
+            # 万が一HTMLが返ってきた場合のチェック
+            if res.text.startswith("<!DOCTYPE") or res.text.startswith("/ja"):
+                print("❌ まだログイン画面にリダイレクトされています。")
+                print("💡 対策: J-Quantsマイページで『V2 APIの利用規約』に同意済みか再確認してください。")
+                return
+
             data = res.json()
             quotes = data.get("daily_quotes", [])
             if quotes:
                 df = pd.DataFrame(quotes)
                 df['date'] = pd.to_datetime(df['Date']).dt.date
-                df['ticker'] = "3048"
-                df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"price","Volume":"volume"})
-                db.save_prices(df[['ticker','date','open','high','low','price','volume']])
-                print("✨ J-Quants V2 接続・保存に完全成功しました！")
+                df['ticker'] = target_code
+                df = df.rename(columns={"Open":"open", "High":"high", "Low":"low", "Close":"price", "Volume":"volume"})
+                # 先ほど開通したSupabaseへ保存！
+                db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
+                print(f"✨ ついに成功！{target_code} のデータをSupabaseに格納しました。")
             else:
-                print("⚠️ 認証は通りましたが、データが空です。")
+                print(f"⚠️ 認証は成功しましたが、{test_date} のデータが空です。")
         else:
-            print(f"❌ 認証失敗。ステータス: {res.status_code}")
-            print(f"内容: {res.text[:100]}") # ログインHTMLが返っているか確認
+            print(f"❌ APIエラー {res.status_code}: {res.text[:100]}")
 
     except Exception as e:
-        print(f"❌ 実行エラー: {e}")
+        print(f"❌ システムエラー: {e}")
+
+if __name__ == "__main__":
+    sync_data()
