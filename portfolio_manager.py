@@ -21,10 +21,9 @@ def sync_data():
     # ✅ 銘柄コード: 30480 (ビックカメラ)
     code = "30480"
 
-    # 🚀 修正ポイント: 過去30日分の範囲を指定して一括取得します
-    # これにより、DBに十分なデータが貯まり、Geminiの分析が走るようになります。
-    today_str = date.today().strftime("%Y%m%d")
-    from_str = (date.today() - timedelta(days=30)).strftime("%Y%m%d")
+    # 🚀 修正ポイント: J-Quants V2 では日付にハイフンが必要です (YYYY-MM-DD)
+    today_str = date.today().strftime("%Y-%m-%d")
+    from_str = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
 
     params = {
         "code": code,
@@ -41,13 +40,17 @@ def sync_data():
             params=params,
             timeout=20,
         )
+        # エラー時にレスポンス内容を表示するように強化
+        if res.status_code != 200:
+            print(f"❌ APIエラー詳細: {res.text}")
+        
         res.raise_for_status()
 
         raw_data = res.json()
         quotes = raw_data.get("data", [])
 
         if not quotes:
-            print(f"⚠️ 取得されたデータが空でした。レスポンス: {raw_data}")
+            print(f"⚠️ 取得されたデータが空でした。")
             return
 
         df = pd.DataFrame(quotes)
@@ -64,13 +67,10 @@ def sync_data():
             columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns}
         )
 
-        # 保存に必要なカラム
         required_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-        
-        # 重複を除去（(ticker, date) がユニークになるように）
         df = df.drop_duplicates(subset=["ticker", "date"])
 
-        # ✅ 保存（method='multi' で高速化）
+        # ✅ 保存
         db.save_prices(df[required_cols])
         print(f"✨ {code} の過去30日分のデータを Supabase へ同期完了しました！")
 
