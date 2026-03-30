@@ -5,6 +5,32 @@ from datetime import date, timedelta
 import database_manager
 
 
+def get_latest_trading_day(api_key: str) -> str:
+    """
+    J-Quants に date を指定せず問い合わせ、
+    実在する最新営業日の日付を取得する
+    """
+    base_url = "https://api.jquants.com/v2/equities/bars/daily"
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+    }
+
+    res = requests.get(
+        base_url,
+        headers=headers,
+        params={"code": "30480"},
+        timeout=20,
+    )
+    res.raise_for_status()
+
+    data = res.json().get("data", [])
+    if not data:
+        raise RuntimeError("最新営業日の取得に失敗しました")
+
+    return data[0]["Date"]  # YYYY-MM-DD
+
+
 def sync_data():
     db = database_manager.DBManager()
 
@@ -20,14 +46,17 @@ def sync_data():
 
     code = "30480"
 
-    # ✅ 過去30営業日 ≒ 過去45暦日（土日祝を考慮して余裕を持つ）
-    to_date = date.today() - timedelta(days=1)
-    from_date = to_date - timedelta(days=45)
+    # ✅ 実在する最新営業日を API から取得
+    latest_date_str = get_latest_trading_day(api_key)
+    latest_date = pd.to_datetime(latest_date_str).date()
+
+    # ✅ 過去30営業日 ≒ 45暦日
+    from_date = latest_date - timedelta(days=45)
 
     params = {
         "code": code,
         "from": from_date.strftime("%Y%m%d"),
-        "to": to_date.strftime("%Y%m%d"),
+        "to": latest_date.strftime("%Y%m%d"),
     }
 
     print(
@@ -43,20 +72,16 @@ def sync_data():
     )
     res.raise_for_status()
 
-    raw_data = res.json()
-    quotes = raw_data.get("data", [])
-
+    quotes = res.json().get("data", [])
     if not quotes:
         print("⚠️ データが取得できませんでした")
         return
 
     df = pd.DataFrame(quotes)
 
-    # ✅ 日付・銘柄コード
     df["date"] = pd.to_datetime(df["Date"]).dt.date
     df["ticker"] = code
 
-    # ✅ V2 カラム名変換
     COLUMN_MAP = {
         "O": "open",
         "H": "high",
@@ -80,7 +105,6 @@ def sync_data():
     if missing:
         raise ValueError(f"必要なカラムが不足しています: {missing}")
 
-    # ✅ 日付昇順 & 重複除去
     df = (
         df[required_cols]
         .drop_duplicates(subset=["ticker", "date"])
