@@ -2,7 +2,6 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine
 
-
 class DBManager:
     def __init__(self):
         db_url = os.getenv("DATABASE_URL")
@@ -11,48 +10,36 @@ class DBManager:
         self.engine = create_engine(db_url)
 
     def save_prices(self, df: pd.DataFrame):
-        df.to_sql(
-            "daily_prices",
-            self.engine,
-            if_exists="append",
-            index=False,
-            method="multi",
-        )
-        print("✅ Supabaseへのデータ格納に成功しました！")
+        try:
+            df.to_sql("daily_prices", self.engine, if_exists="append", index=False, method="multi")
+            print("✅ Supabaseへのデータ格納に成功しました！")
+        except Exception as e:
+            print(f"❌ DB保存エラー: {e}")
+            raise
 
     def load_analysis_data(self, days: int = 30) -> pd.DataFrame:
         """
-        DB に存在する最新日を基準に、直近 N 日分を取得する
-        ※ date カラムが TEXT でも必ず動くように CAST する
+        DBにある最新の日付から、指定された行数（営業日分）を取得する
         """
-        query = """
-            WITH latest AS (
-                SELECT MAX(date::date) AS max_date
-                FROM daily_prices
-            )
-            SELECT
-                p.ticker,
-                p.date::date AS date,
-                p.open,
-                p.high,
-                p.low,
-                p.price,
-                p.volume
-            FROM daily_prices p
-            CROSS JOIN latest l
-            WHERE p.date::date >= (l.max_date - (INTERVAL '1 day' * %(days)s))
-            ORDER BY p.date::date ASC
+        # ❗修正ポイント: 日付計算ではなく、最新から N 件を直接取得します
+        query = f"""
+            SELECT *
+            FROM daily_prices
+            ORDER BY date DESC
+            LIMIT {days}
         """
 
-        df = pd.read_sql(
-            query,
-            self.engine,
-            params={"days": days},
-        )
+        try:
+            df = pd.read_sql(query, self.engine)
 
-        if df.empty:
-            print("⚠️ DBに該当期間のデータが存在しません。")
-        else:
-            print(f"📖 DBから最新日基準で {len(df)} 件のデータをロードしました。")
+            if not df.empty:
+                # Geminiが時系列順に読めるよう、昇順に並べ替えてから返します
+                df = df.sort_values("date").reset_index(drop=True)
+                print(f"📖 DBから最新 {len(df)} 件をロード。最新日: {df['date'].max()}")
+            else:
+                print("⚠️ DBにデータが1件も存在しません。")
 
-        return df
+            return df
+        except Exception as e:
+            print(f"⚠️ データ読み込みエラー: {e}")
+            return pd.DataFrame()
