@@ -6,54 +6,45 @@ import database_manager
 
 def sync_data():
     db = database_manager.DBManager()
-    api_key = os.getenv("JQUANTS_API_KEY")
+    # キーを読み込み、前後の空白を完全に除去
+    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
+    
+    if not api_key:
+        print("❌ APIキーが設定されていません。")
+        return
+
+    print(f"🔑 使用中のAPIキー(先頭5文字): {api_key[:5]}")
     
     headers = {
         "x-api-key": api_key, 
         "accept": "application/json"
     }
     
-    # ターゲット: 3048 (ビックカメラ)
-    # ❗Freeプランで確実に権限がある「1週間前」の特定日を狙い撃ちします
-    target_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    code = "3048"
-    
-    print(f"🎯 J-Quants V2 執念の接続テスト: {code} (Target Date: {target_date})")
-    
-    url = f"https://jpx-jquants.com/api/v2/prices/daily?code={code}&from={target_date}&to={target_date}"
+    # ターゲット: 3048 (ビックカメラ) / 3月23日
+    target_date = "2026-03-23"
+    url = f"https://jpx-jquants.com/api/v2/prices/daily?code=3048&from={target_date}&to={target_date}"
     
     try:
-        # allow_redirects=False にして、リダイレクトされたら即エラーで落とします
+        # allow_redirects=False で "/ja" への逃げを封鎖
         res = requests.get(url, headers=headers, timeout=20, allow_redirects=False)
+        
+        print(f"📡 HTTPステータス: {res.status_code}")
         
         if res.status_code == 200:
             data = res.json()
             quotes = data.get("daily_quotes", [])
-            
             if quotes:
                 df = pd.DataFrame(quotes)
-                # V2のカラム名をDB用に整形
                 df['date'] = pd.to_datetime(df['Date']).dt.date
-                df['ticker'] = code
-                df = df.rename(columns={
-                    "Open": "open", "High": "high", "Low": "low", 
-                    "Close": "price", "Volume": "volume"
-                })
-                
-                # Supabaseに保存（ここで DATABASE_URL の修正が効いてきます！）
-                db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✨ J-Quants V2 からのデータ着弾に成功しました！")
+                df['ticker'] = "3048"
+                df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"price","Volume":"volume"})
+                db.save_prices(df[['ticker','date','open','high','low','price','volume']])
+                print("✨ J-Quants V2 接続・保存に完全成功しました！")
             else:
-                print(f"⚠️ 指定日({target_date})にデータが存在しません。市場休業日かもしれません。")
-                
-        elif res.status_code in [301, 302]:
-            print(f"❌ 依然としてリダイレクト(302)されます。")
-            print(f"原因: APIキーがFreeプランとして認識されていないか、日付の権限不足です。")
+                print("⚠️ 認証は通りましたが、データが空です。")
         else:
-            print(f"❌ APIエラー {res.status_code}: {res.text}")
+            print(f"❌ 認証失敗。ステータス: {res.status_code}")
+            print(f"内容: {res.text[:100]}") # ログインHTMLが返っているか確認
 
     except Exception as e:
-        print(f"❌ 致命的なエラー: {e}")
-
-if __name__ == "__main__":
-    sync_data()
+        print(f"❌ 実行エラー: {e}")
