@@ -1,36 +1,29 @@
-import os
-import pandas as pd
 from sqlalchemy import create_engine
+import os
 
 class DBManager:
-    _engine = None
     def __init__(self):
-        if DBManager._engine is None:
-            # URLから ?prepare_threshold=0 などのオプションを消した純粋なURLを読み込む
-            raw_url = os.getenv("DATABASE_URL")
-            # もしURLにオプションが含まれていたら強制的にカット
-            url = raw_url.split('?')[0]
-            
-            # 接続時にオプションを渡す
-            DBManager._engine = create_engine(
-                url,
-                pool_pre_ping=True,
-                connect_args={
-                    "prepare_threshold": 0,
-                    "connect_timeout": 30
-                }
-            )
-        self.engine = DBManager._engine
+        # GitHub SecretsからURLを取得
+        db_url = os.getenv("DATABASE_URL")
+        
+        # ❗ここが重要：SupabaseのTransaction Mode(6543)でエラーを出さないための設定
+        # ?prepare_threshold=0 を強制的に付与するか、接続オプションで無効化します
+        if "6543" in db_url and "prepare_threshold" not in db_url:
+            if "?" in db_url:
+                db_url += "&prepare_threshold=0"
+            else:
+                db_url += "?prepare_threshold=0"
+        
+        self.engine = create_engine(
+            db_url,
+            # プールサーバー（6543）を使う際の推奨設定
+            connect_args={"options": "-c statement_timeout=30000"} 
+        )
 
     def save_prices(self, df):
-        if df is None or df.empty: return
-        with self.engine.begin() as conn:
-            df.to_sql("daily_prices", conn, if_exists="append", index=False)
-
-    def load_analysis_data(self, days=30):
-        # データが空でもエラーにならないよう安全に取得
-        query = "SELECT * FROM daily_prices ORDER BY date DESC LIMIT 100"
+        # 保存処理（前回と同じ）
         try:
-            return pd.read_sql(query, self.engine)
-        except:
-            return pd.DataFrame()
+            df.to_sql('daily_prices', self.engine, if_exists='append', index=False)
+            print("✅ Supabaseへの保存が正常に完了しました！")
+        except Exception as e:
+            print(f"❌ DB保存エラー: {e}")
