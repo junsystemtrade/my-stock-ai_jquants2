@@ -1,34 +1,7 @@
 import os
 import requests
 import pandas as pd
-from datetime import date, timedelta
 import database_manager
-
-
-def get_latest_trading_day(api_key: str) -> str:
-    """
-    J-Quants に date を指定せず問い合わせ、
-    実在する最新営業日の日付を取得する
-    """
-    base_url = "https://api.jquants.com/v2/equities/bars/daily"
-    headers = {
-        "x-api-key": api_key,
-        "Accept": "application/json",
-    }
-
-    res = requests.get(
-        base_url,
-        headers=headers,
-        params={"code": "30480"},
-        timeout=20,
-    )
-    res.raise_for_status()
-
-    data = res.json().get("data", [])
-    if not data:
-        raise RuntimeError("最新営業日の取得に失敗しました")
-
-    return data[0]["Date"]  # YYYY-MM-DD
 
 
 def sync_data():
@@ -46,23 +19,12 @@ def sync_data():
 
     code = "30480"
 
-    # ✅ 実在する最新営業日を API から取得
-    latest_date_str = get_latest_trading_day(api_key)
-    latest_date = pd.to_datetime(latest_date_str).date()
-
-    # ✅ 過去30営業日 ≒ 45暦日
-    from_date = latest_date - timedelta(days=45)
-
+    # ✅ from / to / date を一切指定しない
     params = {
-        "code": code,
-        "from": from_date.strftime("%Y%m%d"),
-        "to": latest_date.strftime("%Y%m%d"),
+        "code": code
     }
 
-    print(
-        f"🎯 J-Quants V2 データ抽出開始: {code} "
-        f"({params['from']} ～ {params['to']})"
-    )
+    print(f"🎯 J-Quants V2 データ抽出開始: {code}（取得可能な全期間）")
 
     res = requests.get(
         base_url,
@@ -79,6 +41,7 @@ def sync_data():
 
     df = pd.DataFrame(quotes)
 
+    # ✅ 整形
     df["date"] = pd.to_datetime(df["Date"]).dt.date
     df["ticker"] = code
 
@@ -105,6 +68,7 @@ def sync_data():
     if missing:
         raise ValueError(f"必要なカラムが不足しています: {missing}")
 
+    # ✅ 日付昇順・重複排除
     df = (
         df[required_cols]
         .drop_duplicates(subset=["ticker", "date"])
@@ -113,7 +77,7 @@ def sync_data():
 
     db.save_prices(df)
 
-    print(f"✨【完遂】{code} の {len(df)} 営業日分を Supabase に保存しました")
+    print(f"✨【完遂】{code} の {len(df)} 件を Supabase に保存しました")
 
 
 if __name__ == "__main__":
