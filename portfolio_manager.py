@@ -6,53 +6,38 @@ import database_manager
 
 def sync_data():
     db = database_manager.DBManager()
-    # キーの前後空白を徹底排除
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
     
-    headers = {
-        "x-api-key": api_key,
-        "accept": "application/json"
-    }
+    headers = {"x-api-key": api_key, "accept": "application/json"}
+    
+    # ❗Freeプランの鉄則: 12週間(84日)以上前の日付を指定
+    # 2026年3月末から見て、余裕を持って「2025年12月1日」を狙います
+    target_code = "3048"
+    safe_date = "2025-12-01" 
+    
+    print(f"🎯 Freeプラン境界突破テスト: {target_code} (Date: {safe_date})")
+    
+    url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}&from={safe_date}&to={safe_date}"
     
     try:
-        # ❗最重要修正: 30480 ではなく 3048 (4桁) にします
-        target_code = "3048" 
+        res = requests.get(url, headers=headers, timeout=20, allow_redirects=False)
         
-        # Freeプランでも確実に権限がある「2週間前」の1日分だけをテスト
-        test_date = "2026-03-10"
-        
-        print(f"🎯 J-Quants V2 ターゲット修正: {target_code} (Date: {test_date})")
-        
-        # V2エンドポイント
-        price_url = f"https://jpx-jquants.com/api/v2/prices/daily?code={target_code}&from={test_date}&to={test_date}"
-        
-        # リダイレクトを許さず、生の内容を確認
-        res = requests.get(price_url, headers=headers, timeout=20, allow_redirects=False)
-        
-        if res.status_code == 200:
-            # 万が一HTMLが返ってきた場合のチェック
-            if res.text.startswith("<!DOCTYPE") or res.text.startswith("/ja"):
-                print("❌ まだログイン画面にリダイレクトされています。")
-                print("💡 対策: J-Quantsマイページで『V2 APIの利用規約』に同意済みか再確認してください。")
-                return
-
+        if res.status_code == 200 and not res.text.startswith("/ja"):
             data = res.json()
             quotes = data.get("daily_quotes", [])
             if quotes:
                 df = pd.DataFrame(quotes)
+                # DB保存処理（カラム名は前回同様）
                 df['date'] = pd.to_datetime(df['Date']).dt.date
                 df['ticker'] = target_code
-                df = df.rename(columns={"Open":"open", "High":"high", "Low":"low", "Close":"price", "Volume":"volume"})
-                # 先ほど開通したSupabaseへ保存！
-                db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✨ ついに成功！{target_code} のデータをSupabaseに格納しました。")
+                df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"price","Volume":"volume"})
+                db.save_prices(df[['ticker','date','open','high','low','price','volume']])
+                print(f"✨ 12週間の壁を突破！{safe_date} のデータを取得・保存しました。")
             else:
-                print(f"⚠️ 認証は成功しましたが、{test_date} のデータが空です。")
+                print("⚠️ 認証は通りましたが、データが空です。")
         else:
-            print(f"❌ APIエラー {res.status_code}: {res.text[:100]}")
+            print(f"❌ 依然としてリダイレクト。ステータス: {res.status_code}")
+            print(f"この日付({safe_date})でもダメな場合、APIキー自体の権限を再確認する必要があります。")
 
     except Exception as e:
-        print(f"❌ システムエラー: {e}")
-
-if __name__ == "__main__":
-    sync_data()
+        print(f"❌ エラー: {e}")
