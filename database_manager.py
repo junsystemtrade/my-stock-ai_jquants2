@@ -17,3 +17,12 @@ class DBManager:
         if df is None or df.empty: return
         with self.engine.begin() as conn:
             df.to_sql("daily_prices", conn, if_exists="append", index=False)
+
+    def load_analysis_data(self, days=30):
+        """分析用に最新データを取得するメソッド（追加）"""
+        query = f"SELECT * FROM daily_prices ORDER BY date DESC LIMIT 100"
+        try:
+            return pd.read_sql(query, self.engine)
+        except Exception as e:
+            print(f"⚠️ データ読み込みエラー: {e}")
+            return pd.DataFrame()
