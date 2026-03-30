@@ -1,7 +1,5 @@
 import os
-import io
 import time
-import gzip
 import requests
 import pandas as pd
 from datetime import date, timedelta
@@ -10,187 +8,166 @@ import database_manager
 BASE_API = "https://api.jquants.com/v2"
 EQ_DAILY_ENDPOINT = "/equities/bars/daily"
 
+
+class RateLimiter:
+    """
+    Freeプランの 5 req/min を守るため、1リクエストあたり最低12秒以上あける。[2](https://jpx-jquants.com/en/spec/rate-limits)[3](https://jpx-jquants.com/spec/rate-limits)
+    余裕を見てデフォルト 13秒。
+    """
+    def __init__(self, min_interval_sec: float = 13.0):
+        self.min_interval = float(min_interval_sec)
+        self._last = 0.0
+
+    def wait(self):
+        now = time.monotonic()
+        elapsed = now - self._last
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self._last = time.monotonic()
+
+
 def _headers(api_key: str) -> dict:
-    return {"x-api-key": api_key, "Accept": "application/json"}
+    return {"x-api-key": api_key, "Accept": "application/json"}
 
-# ---------------------------
-# Bulk API (Lightプラン以上用)
-# ---------------------------
-def _bulk_list_files(api_key: str) -> list[dict]:
-    url = f"{BASE_API}/bulk/list"
-    r = requests.get(url, headers=_headers(api_key), params={"endpoint": EQ_DAILY_ENDPOINT}, timeout=30)
-    r.raise_for_status()
-    return r.json().get("data", [])
 
-def _bulk_get_download_url(api_key: str, key: str) -> str:
-    url = f"{BASE_API}/bulk/get"
-    r = requests.get(url, headers=_headers(api_key), params={"key": key}, timeout=30)
-    r.raise_for_status()
-    return r.json()["url"]
+def _latest_accessible_date_from_code(api_key: str, limiter: RateLimiter, sample_code: str) -> date:
+    """
+    code指定で「その銘柄の取れる全期間」を取得し、末尾Dateを “Freeで取得可能な最新日” として採用する。
+    /equities/bars/daily は code または date が必須で、code指定で特定銘柄のヒストリカルが取れる。[1](https://jpx-jquants.com/en/spec/eq-bars-daily)
+    """
+    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
+    limiter.wait()
+    r = requests.get(url, headers=_headers(api_key), params={"code": sample_code}, timeout=30)
+    r.raise_for_status()
 
-def _read_csv_gz_from_url(download_url: str, chunksize: int = 100_000):
-    with requests.get(download_url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with gzip.GzipFile(fileobj=r.raw) as gz:
-            for chunk in pd.read_csv(gz, chunksize=chunksize):
-                yield chunk
+    data = r.json().get("data", [])
+    if not data:
+        raise RuntimeError("サンプル銘柄のデータが空でした（APIキー/銘柄コード/プランを確認）")
 
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    if "Date" not in df.columns or "Code" not in df.columns:
-        raise ValueError(f"想定外のカラム構成です: {df.columns}")
-    
-    out = pd.DataFrame()
-    out["date"] = pd.to_datetime(df["Date"]).dt.date
-    out["ticker"] = df["Code"].astype(str)
-    
-    col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
-    for src, dst in col_map.items():
-        out[dst] = df[src] if src in df.columns else pd.NA
-        
-    return out[["ticker", "date", "open", "high", "low", "price", "volume"]].drop_duplicates()
+    # Date は YYYY-MM-DD で来る
+    latest_str = data[-1]["Date"]
+    return pd.to_datetime(latest_str).date()
 
-# ---------------------------
-# Daily API (Free/Lightプラン用フォールバック)
-# ---------------------------
-def _find_latest_trading_date_str(api_key: str, lookback_days: int = 30) -> str:
-    """
-    429エラーを回避するため、慎重に最新営業日を探索する
-    """
-    d = date.today() - timedelta(days=1)
-    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
 
-    print(f"🔍 429回避モードで最新営業日を探索中 (起点: {d})...")
+def _fetch_all_issues_for_date(api_key: str, date_str: str, limiter: RateLimiter) -> list[dict]:
+    """
+    date指定で「その日の全銘柄」を取得。pagination_key で完走。[1](https://jpx-jquants.com/en/spec/eq-bars-daily)
+    Freeはレートが厳しいので、ページめくりごとに limiter.wait() を必ず入れる。
+    """
+    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
+    rows: list[dict] = []
+    pagination_key = None
 
-    for _ in range(lookback_days):
-        if d.weekday() >= 5: # 土日はスキップ
-            d -= timedelta(days=1)
-            continue
-            
-        date_str = d.strftime("%Y-%m-%d")
-        
-        # 💡 戦略的待機: API制限に触れないよう、リクエスト前に1.5秒休む
-        time.sleep(1.5)
-        
-        try:
-            r = requests.get(url, headers=_headers(api_key), params={"date": date_str}, timeout=20)
-            
-            if r.status_code == 200:
-                print(f"✨ ヒットしました: {date_str}")
-                return date_str
-            
-            print(f"  - {date_str}: {r.status_code}")
-            
-            if r.status_code == 429:
-                print("⏳ レート制限(429)を検知。ペナルティ解除のため60秒待機します...")
-                time.sleep(60.0)
-                # 429が出た日はカウントせず、もう一度同じ日からリトライさせる
-                continue
+    while True:
+        params = {"date": date_str}
+        if pagination_key:
+            params["pagination_key"] = pagination_key
 
-        except Exception as e:
-            print(f"  - {date_str}: 通信エラー {e}")
-        
-        d -= timedelta(days=1)
-    
-    raise RuntimeError(f"直近 {lookback_days} 日間に有効なデータが見つかりませんでした。")
+        limiter.wait()
+        r = requests.get(url, headers=_headers(api_key), params=params, timeout=30)
 
-def _fetch_all_issues_for_date(api_key: str, date_str: str) -> list[dict]:
-    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-    rows = []
-    pagination_key = None
+        # 429: レート制限。一定時間待って再試行するのが推奨。[2](https://jpx-jquants.com/en/spec/rate-limits)[3](https://jpx-jquants.com/spec/rate-limits)
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", "60"))
+            time.sleep(retry_after)
+            continue
 
-    while True:
-        params = {"date": date_str}
-        if pagination_key:
-            params["pagination_key"] = pagination_key
+        # 400: 非取引日/プラン範囲外などの可能性 → “その日は取れない” として空で返す
+        if r.status_code == 400:
+            return []
 
-        # 💡 ページネーション時も慎重に待機
-        time.sleep(1.5)
-        
-        r = requests.get(url, headers=_headers(api_key), params=params, timeout=30)
-        
-        if r.status_code == 429:
-            print("⏳ [Pagination] 429検知。60秒待機...")
-            time.sleep(60.0)
-            continue
-            
-        r.raise_for_status()
-        
-        payload = r.json()
-        rows.extend(payload.get("data", []))
-        pagination_key = payload.get("pagination_key")
-        
-        if not pagination_key:
-            break
-            
-    return rows
+        r.raise_for_status()
+        payload = r.json()
 
-# ---------------------------
-# メインロジック
-# ---------------------------
+        rows.extend(payload.get("data", []))
+        pagination_key = payload.get("pagination_key")
+
+        if not pagination_key:
+            break
+
+    return rows
+
+
+def _normalize_rows_to_df(rows: list[dict]) -> pd.DataFrame:
+    """
+    APIレスポンス（Date, Code, O,H,L,C,Vo）をDB保存用（ticker, date, open, high, low, price, volume）へ整形。[1](https://jpx-jquants.com/en/spec/eq-bars-daily)
+    """
+    df = pd.DataFrame(rows)
+
+    df["date"] = pd.to_datetime(df["Date"]).dt.date
+    df["ticker"] = df["Code"].astype(str)
+
+    col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    required = ["ticker", "date", "open", "high", "low", "price", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"必要カラム不足: {missing} / columns={list(df.columns)}")
+
+    df = (
+        df[required]
+        .drop_duplicates(subset=["ticker", "date"])
+        .sort_values(["date", "ticker"])
+        .reset_index(drop=True)
+    )
+    return df
+
+
 def sync_data():
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    db = database_manager.DBManager()
-    
-    print("🚀 データ同期エンジン起動 (低速・安定モード)")
+    """
+    Freeプラン向け:
+      1) サンプル銘柄(code)の末尾Dateで “取得可能な最新日” を確定
+      2) その日から過去へ、指定日数だけ “全銘柄(date指定)” を掘る
+    """
+    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("JQUANTS_API_KEY が設定されていません")
 
-    # 1. Bulk API への挑戦
-    try:
-        files = _bulk_list_files(api_key)
-        if files:
-            print(f"📦 Bulkルート: {len(files)} ファイルを検出")
-            for f in sorted(files, key=lambda x: x.get("Key", "")):
-                url = _bulk_get_download_url(api_key, f["Key"])
-                for chunk in _read_csv_gz_from_url(url):
-                    db.save_prices(_normalize_df(chunk))
-            print("🎉 Bulk同期完了")
-            return
-    except Exception as e:
-        print(f"⚠️ Bulk利用不可。Daily APIへ切り替えます。")
+    db = database_manager.DBManager()
 
-    # 2. Daily API による地道なバックフィル
-    try:
-        latest_date_str = _find_latest_trading_date_str(api_key)
-        current_d = pd.to_datetime(latest_date_str).date()
-        
-        print(f"📅 Dailyルート: {latest_date_str} から遡って取得を開始します")
+    # Freeの 5req/min を確実に守る [2](https://jpx-jquants.com/en/spec/rate-limits)[3](https://jpx-jquants.com/spec/rate-limits)
+    limiter = RateLimiter(min_interval_sec=float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "13")))
 
-        # GitHub Actionsの制限(6時間)を考慮しつつ、まずは直近30営業日分
-        for _ in range(30):
-            d_str = current_d.strftime("%Y-%m-%d")
-            print(f"📥 {d_str} の全銘柄データを取得中...")
-            
-            try:
-                rows = _fetch_all_issues_for_date(api_key, d_str)
-                if rows:
-                    df = pd.DataFrame(rows)
-                    df["date"] = pd.to_datetime(df["Date"]).dt.date
-                    df["ticker"] = df["Code"].astype(str)
-                    
-                    col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
-                    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-                    
-                    target_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-                    db.save_prices(df[target_cols].drop_duplicates())
-                    print(f"✅ {len(df)} 件保存完了")
-                else:
-                    print(f"⚠️ {d_str}: データなし")
-            except Exception as e:
-                if "400" in str(e):
-                    print(f"⛔ {d_str}: 取得限界(プラン上限)に達しました。")
-                    break
-                print(f"❌ {d_str} でエラー: {e}")
+    sample_code = os.getenv("SAMPLE_CODE_FOR_RANGE", "30480")
+    days_per_run = int(os.getenv("BACKFILL_DAYS_PER_RUN", "1"))
 
-            current_d -= timedelta(days=1)
-            while current_d.weekday() >= 5:
-                current_d -= timedelta(days=1)
-            
-            # 日付切り替え時も一息つく
-            time.sleep(2.0)
+    print("🚀 Free全銘柄バックフィル起動")
+    print(f"   sample_code={sample_code}, days_per_run={days_per_run}, min_interval={limiter.min_interval}s")
 
-    except RuntimeError as e:
-        print(f"❌ 致命的なエラー: {e}")
+    # ✅ “直近探索”はしない。codeから確定する
+    latest_date = _latest_accessible_date_from_code(api_key, limiter, sample_code)
+    print(f"✅ Freeで取得可能な最新日（code={sample_code}より）: {latest_date}")
 
-    print("✨ 全工程終了。お疲れ様でした！")
+    current_d = latest_date
+    saved_total = 0
+
+    for _ in range(days_per_run):
+        # 土日をスキップ
+        while current_d.weekday() >= 5:
+            current_d -= timedelta(days=1)
+
+        d_str = current_d.strftime("%Y-%m-%d")
+        print(f"📥 全銘柄取得: {d_str}")
+
+        rows = _fetch_all_issues_for_date(api_key, d_str, limiter)
+
+        # 取れない日（400/空）はここで止める：= プラン上限/非取引日の可能性
+        if not rows:
+            print(f"⛔ {d_str}: 取得不可（非取引日/プラン範囲外の可能性）→ 今回は停止")
+            break
+
+        df = _normalize_rows_to_df(rows)
+        db.save_prices(df)
+        saved_total += len(df)
+
+        print(f"✅ 保存完了: {d_str} / rows={len(df)}")
+
+        # 前日へ
+        current_d -= timedelta(days=1)
+
+    print(f"🎉 今回の同期完了: saved_rows={saved_total}")
+
 
 if __name__ == "__main__":
-    sync_data()
+    sync_data()
