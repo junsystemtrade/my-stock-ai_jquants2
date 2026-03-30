@@ -1,65 +1,58 @@
 import os
-import requests
 import pandas as pd
-import database_manager
+from sqlalchemy import create_engine
 
-# ✅ この関数名が GitHub Actions の python -c "..." から呼ばれます
-def sync_data():
-    db = database_manager.DBManager()
 
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("JQUANTS_API_KEY が設定されていません")
+class DBManager:
+    def __init__(self):
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            raise RuntimeError("DATABASE_URL が設定されていません")
+        self.engine = create_engine(db_url)
 
-    base_url = "https://api.jquants.com/v2/equities/bars/daily"
-    headers = {
-        "x-api-key": api_key,
-        "Accept": "application/json",
-    }
-
-    # ✅ ターゲット: 30480 (ビックカメラ)
-    code = "30480"
-
-    # 日付指定なし（プラン上限まで全取得）
-    params = {"code": code}
-
-    print(f"🎯 J-Quants V2 データ抽出開始: {code}")
-
-    try:
-        res = requests.get(
-            base_url,
-            headers=headers,
-            params=params,
-            timeout=30,
+    def save_prices(self, df: pd.DataFrame):
+        df.to_sql(
+            "daily_prices",
+            self.engine,
+            if_exists="append",
+            index=False,
+            method="multi",
         )
-        res.raise_for_status()
+        print("✅ Supabaseへのデータ格納に成功しました！")
 
-        raw_data = res.json()
-        quotes = raw_data.get("data", [])
-        
-        if not quotes:
-            print("⚠️ データが取得できませんでした。")
-            return
+    def load_analysis_data(self, days: int = 30) -> pd.DataFrame:
+        """
+        DB に存在する最新日を基準に、直近 N 日分を取得する
+        ※ date カラムが TEXT でも必ず動くように CAST する
+        """
+        query = """
+            WITH latest AS (
+                SELECT MAX(date::date) AS max_date
+                FROM daily_prices
+            )
+            SELECT
+                p.ticker,
+                p.date::date AS date,
+                p.open,
+                p.high,
+                p.low,
+                p.price,
+                p.volume
+            FROM daily_prices p
+            CROSS JOIN latest l
+            WHERE p.date::date >= (l.max_date - (INTERVAL '1 day' * %(days)s))
+            ORDER BY p.date::date ASC
+        """
 
-        df = pd.DataFrame(quotes)
-        df["date"] = pd.to_datetime(df["Date"]).dt.date
-        df["ticker"] = code
+        df = pd.read_sql(
+            query,
+            self.engine,
+            params={"days": days},
+        )
 
-        COLUMN_MAP = {
-            "O": "open", "H": "high", "L": "low", "Low": "low", "C": "price", "Vo": "volume"
-        }
-        df = df.rename(columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns})
+        if df.empty:
+            print("⚠️ DBに該当期間のデータが存在しません。")
+        else:
+            print(f"📖 DBから最新日基準で {len(df)} 件のデータをロードしました。")
 
-        required_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-        df = df[required_cols].drop_duplicates(subset=["ticker", "date"]).sort_values("date")
-
-        db.save_prices(df)
-        print(f"✨【完遂】{code} の {len(df)} 件を同期しました。")
-
-    except Exception as e:
-        print(f"❌ 実行エラー: {e}")
-        raise
-
-# 直接実行用（デバッグ用）
-if __name__ == "__main__":
-    sync_data()
+        return df
