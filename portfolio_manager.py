@@ -1,45 +1,49 @@
 import os
+import requests
 import pandas as pd
-from sqlalchemy import create_engine
+import database_manager
 
-class DBManager:
-    def __init__(self):
-        db_url = os.getenv("DATABASE_URL")
-        if not db_url:
-            raise RuntimeError("DATABASE_URL が設定されていません")
-        self.engine = create_engine(db_url)
+def sync_data():
+    db = database_manager.DBManager()
+    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
 
-    def save_prices(self, df: pd.DataFrame):
-        try:
-            df.to_sql("daily_prices", self.engine, if_exists="append", index=False, method="multi")
-            print("✅ Supabaseへのデータ格納に成功しました！")
-        except Exception as e:
-            print(f"❌ DB保存エラー: {e}")
-            raise
+    if not api_key:
+        raise RuntimeError("JQUANTS_API_KEY が設定されていません")
 
-    def load_analysis_data(self, days: int = 30) -> pd.DataFrame:
-        """
-        DBにある最新の日付から、指定された行数（営業日分）を取得する
-        """
-        # ❗修正ポイント: 日付計算ではなく、最新から N 件を直接取得します
-        query = f"""
-            SELECT *
-            FROM daily_prices
-            ORDER BY date DESC
-            LIMIT {days}
-        """
+    base_url = "https://api.jquants.com/v2/equities/bars/daily"
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
 
-        try:
-            df = pd.read_sql(query, self.engine)
+    # 銘柄: 30480 (ビックカメラ)
+    code = "30480"
+    params = {"code": code}
 
-            if not df.empty:
-                # Geminiが時系列順に読めるよう、昇順に並べ替えてから返します
-                df = df.sort_values("date").reset_index(drop=True)
-                print(f"📖 DBから最新 {len(df)} 件をロード。最新日: {df['date'].max()}")
-            else:
-                print("⚠️ DBにデータが1件も存在しません。")
+    print(f"🎯 J-Quants V2 データ抽出開始: {code}")
 
-            return df
-        except Exception as e:
-            print(f"⚠️ データ読み込みエラー: {e}")
-            return pd.DataFrame()
+    try:
+        res = requests.get(base_url, headers=headers, params=params, timeout=30)
+        res.raise_for_status()
+
+        quotes = res.json().get("data", [])
+        if not quotes:
+            print("⚠️ データが取得できませんでした")
+            return
+
+        df = pd.DataFrame(quotes)
+        df["date"] = pd.to_datetime(df["Date"]).dt.date
+        df["ticker"] = code
+
+        COLUMN_MAP = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
+        df = df.rename(columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns})
+
+        cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+        df = df[cols].drop_duplicates(subset=["ticker", "date"]).sort_values("date")
+
+        db.save_prices(df)
+        print(f"✨【完遂】{code} の {len(df)} 件を同期しました。")
+
+    except Exception as e:
+        print(f"❌ 実行エラー: {e}")
+        raise
+
+if __name__ == "__main__":
+    sync_data()
