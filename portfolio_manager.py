@@ -7,52 +7,43 @@ def sync_data():
     db = database_manager.DBManager()
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
     
-    # ❗【重要】最新のAPI専用エンドポイントに修正
-    # クイックスタートの指示通り api.jquants.com を使用します
+    # 🎯 クイックスタートで判明した正しいエンドポイント
     base_url = "https://api.jquants.com/v2/equities/bars/daily"
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
     
-    headers = {
-        "x-api-key": api_key,
-        "Accept": "application/json"
-    }
+    # テスト銘柄: 30480 (ビックカメラ)
+    params = {"code": "30480", "date": "20251201"}
     
-    # クイックスタートの例に倣い、86970 (日本取引所) または 30480 (5桁) を試します
-    # Freeプランの「12週間の壁」を考慮し、20251201 形式で指定
-    params = {
-        "code": "30480",  # V2は5桁（後ろに0）が必要な場合があります
-        "date": "20251201"
-    }
-    
-    print(f"🎯 真・J-Quants V2 アタック: {params['code']} ({params['date']})")
+    print(f"🎯 J-Quants V2 データ抽出開始: {params['code']}")
 
     try:
-        # curl -G と同じ挙動にするため params を使用
         res = requests.get(base_url, headers=headers, params=params, timeout=20)
         
-        print(f"📡 Status: {res.status_code}")
-        
         if res.status_code == 200:
-            data = res.json()
-            # V2のレスポンス構造（bars）に合わせて取得
-            bars = data.get("bars", [])
+            raw_data = res.json()
+            # ❗重要: 'bars' ではなく 'data' キーから取得します
+            quotes = raw_data.get("data", [])
             
-            if bars:
-                df = pd.DataFrame(bars)
-                # カラム名変換（J-Quants V2の仕様に合わせる）
-                # 例: Date -> date, Open -> open など
+            if quotes:
+                df = pd.DataFrame(quotes)
+                
+                # J-Quants V2 (data形式) のカラム名をDB用に変換
                 df['date'] = pd.to_datetime(df['Date']).dt.date
                 df['ticker'] = "3048"
                 df = df.rename(columns={
-                    "Open": "open", "High": "high", "Low": "low", 
-                    "Close": "price", "Volume": "volume"
+                    "O": "open", "H": "high", "Low": "low", # Lの場合もあり
+                    "C": "price", "Vo": "volume"
                 })
+                # 万が一 'L' が 'low' になっていない場合の補完
+                if 'L' in df.columns: df = df.rename(columns={"L": "low"})
                 
+                # Supabaseに保存！
                 db.save_prices(df[['ticker', 'date', 'open', 'high', 'low', 'price', 'volume']])
-                print(f"✨【歴史的勝利】J-Quants V2 正式APIからのデータ着弾に成功！")
+                print(f"✨【完全勝利】Supabaseへの保存に成功しました！")
             else:
-                print(f"⚠️ 接続成功ですがデータが空です。レスポンス: {data}")
+                print(f"⚠️ データが空でした。レスポンス: {raw_data}")
         else:
-            print(f"❌ エラー: {res.status_code} / {res.text}")
+            print(f"❌ 通信エラー: {res.status_code}")
 
     except Exception as e:
-        print(f"❌ 実行失敗: {e}")
+        print(f"❌ 実行エラー: {e}")
