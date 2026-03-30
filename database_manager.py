@@ -4,30 +4,22 @@ from sqlalchemy import create_engine
 
 class DBManager:
     def __init__(self):
+        # GitHub Secrets の修正後のURLを取得
         db_url = os.getenv("DATABASE_URL")
         
-        # ❗修正ポイント：URLから余計なクエリパラメータを完全に除去し、
-        # 接続オプションを別で渡すことで psycopg2 のエラーを回避します。
-        if "?" in db_url:
-            db_url = db_url.split("?")[0]
-            
+        # 接続の安定性を高めるための最小限の設定
         self.engine = create_engine(
             db_url,
+            pool_pre_ping=True, # 接続切れを自動検知
             connect_args={
-                # ここに書くのではなく、execution_options で制御するのが最も安全です
-                "options": "-c statement_timeout=30000"
-            },
-            # ❗これがPgBouncer(6543ポート)でのエラーを消す決定打です
-            execution_options={
-                "prepared_statement_name_func": lambda name: None
+                "prepare_threshold": 0 # PgBouncer対策
             }
         )
 
     def save_prices(self, df):
         try:
-            # 既存のテーブルに追記
             df.to_sql('daily_prices', self.engine, if_exists='append', index=False)
-            print("✨【DB着弾】Supabaseへの格納に成功しました！")
+            print("✅ Supabaseへのデータ格納に成功しました！")
         except Exception as e:
             print(f"❌ DB保存エラー: {e}")
 
