@@ -1,0 +1,39 @@
+# .github/workflows/backfill.yml
+# ================================
+# 初回のみ実行する 5 年分バックフィル workflow
+# ※ DB が空の状態から全データを取得するため非常に時間がかかる
+#    J-Quants Free プランは 5 req/min のため 1 日あたり約 13 秒かかる
+#    5 年 × 約 250 営業日 = 約 1250 日 → 約 4.5 時間
+
+name: Initial Backfill (Run Once)
+
+on:
+  workflow_dispatch:    # 手動実行のみ（初回だけ使う）
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360    # 最大 6 時間
+
+    env:
+      DATABASE_URL:             ${{ secrets.DATABASE_URL }}
+      JQUANTS_API_KEY:          ${{ secrets.JQUANTS_API_KEY }}
+      GOOGLE_API_KEY:           ${{ secrets.GOOGLE_API_KEY }}
+      DISCORD_WEBHOOK_URL:      ${{ secrets.DISCORD_WEBHOOK_URL }}
+      JQUANTS_MIN_INTERVAL_SEC: "13"
+
+    steps:
+      - name: ☁️ リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 依存パッケージのインストール
+        run: pip install -r requirements.txt
+
+      - name: 🗄️ 初回バックフィル実行
+        run: python portfolio_manager.py
