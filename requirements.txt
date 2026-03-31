@@ -1,8 +1,23 @@
-google-genai
-jquants-api-client
-yfinance
-sqlalchemy
+# requirements.txt
+# -----------------
+# 必要なパッケージ一覧
+
+# DB
+sqlalchemy>=2.0
 psycopg2-binary
-pandas
+
+# データ取得
 requests
+yfinance
+beautifulsoup4
+openpyxl          # JPX Excel 読み込み用
+
+# データ処理
+pandas
+numpy
+
+# Gemini AI
 google-generativeai
+
+# 設定ファイル
+pyyaml
