@@ -1,33 +1,39 @@
-name: Daily Stock AI Analysis
+# .github/workflows/daily_scan.yml
+# =================================
+# 毎営業日の銘柄スキャン + Discord 通知
+# 平日 06:30 JST（= UTC 21:30 前日）に自動実行
+
+name: Daily Stock Scan
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5' # 平日19時（日本時間）
-  workflow_dispatch:
+    - cron: "30 21 * * 0-4"   # UTC 21:30 = JST 06:30（日〜木 → 月〜金実行）
+  workflow_dispatch:            # 手動実行も可能
 
 jobs:
-  build-and-run:
+  scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      DATABASE_URL:          ${{ secrets.DATABASE_URL }}
+      JQUANTS_API_KEY:       ${{ secrets.JQUANTS_API_KEY }}
+      GOOGLE_API_KEY:        ${{ secrets.GOOGLE_API_KEY }}
+      DISCORD_WEBHOOK_URL:   ${{ secrets.DISCORD_WEBHOOK_URL }}
+      JQUANTS_MIN_INTERVAL_SEC: "13"   # Free プラン: 5 req/min
+
     steps:
-      - name: Checkout code
+      - name: ☁️ リポジトリをチェックアウト
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 🐍 Python セットアップ
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas yfinance sqlalchemy psycopg2-binary requests google-generativeai google-genai
+      - name: 📦 依存パッケージのインストール
+        run: pip install -r requirements.txt
 
-      - name: Execute AI Analysis
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          python -c "import portfolio_manager; portfolio_manager.sync_data()"
-          python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
+      - name: 🚀 銘柄スキャン実行
+        run: python main.py
