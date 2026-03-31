@@ -1,174 +1,89 @@
-"""
-portfolio_manager.py
-====================
-株価データの取得・DB同期を担当。
-【一括モード】2年分のデータを強制的にバックフィルします。
-"""
-
-import io
 import os
 import time
-import requests
 import pandas as pd
 import yfinance as yf
-from datetime import date, timedelta
-import database_manager
+from datetime import datetime, timedelta
+from database_manager import DBManager
 
-# -----------------------------------------------------------------------
-# 定数
-# -----------------------------------------------------------------------
-BASE_API          = "https://api.jquants.com/v2"
-EQ_DAILY_ENDPOINT = "/equities/bars/daily"
-BACKFILL_YEARS    = 2          # ターゲット期間
-SAMPLE_CODE       = "30480"    # ビックカメラ
-
-class RateLimiter:
-    def __init__(self, min_interval_sec: float = 13.0):
-        self.min_interval = float(min_interval_sec)
-        self._last = 0.0
-
-    def wait(self):
-        now = time.monotonic()
-        elapsed = now - self._last
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last = time.monotonic()
-
-def get_target_tickers() -> dict:
-    from bs4 import BeautifulSoup
-    base_url  = "https://www.jpx.co.jp"
-    list_page = f"{base_url}/markets/statistics-equities/misc/01.html"
-    headers   = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res  = requests.get(list_page, headers=headers, timeout=30)
-        soup = BeautifulSoup(res.text, "html.parser")
-        link = soup.find("a", href=lambda x: x and "data_j.xls" in x)
-        if not link: return {}
-        excel_url = base_url + link["href"]
-        resp      = requests.get(excel_url, headers=headers, timeout=60)
-        df        = pd.read_excel(io.BytesIO(resp.content))
-        stock_map = {}
-        for _, row in df.iterrows():
-            code = str(row.iloc[1]).strip()
-            name = str(row.iloc[2]).strip()
-            if len(code) == 4 and code.isdigit():
-                stock_map[f"{code}.T"] = {"name": name}
-        return stock_map
-    except Exception as e:
-        print(f"❌ JPX銘柄マスタ取得失敗: {e}")
-        return {"30480.T": {"name": "ビックカメラ"}}
-
-def _jquants_headers(api_key: str) -> dict:
-    return {"x-api-key": api_key, "Accept": "application/json"}
-
-def _jquants_latest_accessible_date(api_key: str, limiter: RateLimiter) -> date:
-    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-    limiter.wait()
-    r = requests.get(url, headers=_jquants_headers(api_key), params={"code": SAMPLE_CODE}, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    return pd.to_datetime(data[-1]["Date"]).date()
-
-def _jquants_fetch_day(api_key: str, date_str: str, limiter: RateLimiter) -> list[dict]:
-    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-    rows = []
-    pagination_key = None
-    while True:
-        params = {"date": date_str}
-        if pagination_key: params["pagination_key"] = pagination_key
-        limiter.wait()
-        r = requests.get(url, headers=_jquants_headers(api_key), params=params, timeout=30)
-        if r.status_code == 429:
-            time.sleep(60); continue
-        if r.status_code == 400: return []
-        r.raise_for_status()
-        payload = r.json()
-        rows.extend(payload.get("data", []))
-        pagination_key = payload.get("pagination_key")
-        if not pagination_key: break
-    return rows
-
-def _jquants_rows_to_df(rows: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["Date"]).dt.date
-    df["ticker"] = df["Code"].astype(str)
-    col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    return df[["ticker", "date", "open", "high", "low", "price", "volume"]].reset_index(drop=True)
-
-def _yahoo_fetch_range(tickers: list[str], start: str, end: str) -> pd.DataFrame:
-    if not tickers: return pd.DataFrame()
-    print(f"📡 Yahoo Finance 取得中... ({start})")
-    try:
-        raw = yf.download(tickers, start=start, end=end, interval="1d", auto_adjust=True, progress=False, group_by="ticker")
-        records = []
-        for ticker in tickers:
-            try:
-                df_t = raw[ticker].dropna(how="all")
-                for idx, row in df_t.iterrows():
-                    records.append({
-                        "ticker": ticker.replace(".T", ""), "date": idx.date(),
-                        "open": row.get("Open"), "high": row.get("High"),
-                        "low": row.get("Low"), "price": row.get("Close"),
-                        "volume": row.get("Volume"),
-                    })
-            except: continue
-        return pd.DataFrame(records)
-    except Exception as e:
-        print(f"❌ Yahoo Finance 失敗: {e}")
-        return pd.DataFrame()
-
-def _business_days(start: date, end: date) -> list[date]:
-    days = []
-    d = start
-    while d <= end:
-        if d.weekday() < 5: days.append(d)
-        d += timedelta(days=1)
-    return days
-
-# -----------------------------------------------------------------------
-# メイン同期関数（強制バックフィル仕様）
-# -----------------------------------------------------------------------
-def sync_data():
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    db = database_manager.DBManager()
-    limiter = RateLimiter(min_interval_sec=float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "13")))
-
-    print("🔍 データ同期プロセス開始...")
-    jquants_latest = _jquants_latest_accessible_date(api_key, limiter)
+def sync_data_3years():
+    db = DBManager()
     
-    # 【重要】開始日を「今日から2年前」に固定して、全日程をチェックする
-    start_date = jquants_latest - timedelta(days=BACKFILL_YEARS * 365)
-    print(f"🚀 【強制モード】2年分バックフィル実行中: {start_date} 〜 {jquants_latest}")
-
-    target_days = _business_days(start_date, jquants_latest)
-    print(f"📅 合計チェック日数: {len(target_days)} 日")
-
+    # 1. 銘柄リストの取得
+    from portfolio_manager import get_target_tickers
     ticker_map = get_target_tickers()
-    all_yf_tickers = list(ticker_map.keys())
+    all_tickers = list(ticker_map.keys())
+    
+    # 2. 期間設定 (3年前 〜 今日)
+    BACKFILL_DAYS = 3 * 365
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=BACKFILL_DAYS)
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
 
-    for target_date in target_days:
-        d_str = target_date.strftime("%Y-%m-%d")
-        
-        # まず J-Quants を試す
-        rows = _jquants_fetch_day(api_key, d_str, limiter)
-        
-        if rows:
-            df = _jquants_rows_to_df(rows)
-            db.save_prices(df)
-            print(f"✅ {d_str}: J-Quants {len(df)} 件保存")
-        else:
-            # 12週間より前などは Yahoo Finance で補完
-            yf_end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            df_yf = _yahoo_fetch_range(all_yf_tickers, d_str, yf_end)
-            if not df_yf.empty:
-                db.save_prices(df_yf)
-                print(f"✅ {d_str}: Yahoo Finance {len(df_yf)} 件保存")
+    print(f"📅 3年分バックフィル開始: {start_str} 〜 {end_str}")
+    print(f"📊 対象: {len(all_tickers)} 銘柄")
+
+    # 3. 10銘柄ずつのバッチ処理
+    # (Yahooの制限を考慮し、20より10の方が安定します)
+    batch_size = 10 
+    
+    for i in range(0, len(all_tickers), batch_size):
+        batch = all_tickers[i : i + batch_size]
+        print(f"📦 [{i}/{len(all_tickers)}] {batch[0]}... 取得開始")
+
+        try:
+            # yfinanceで3年分を一括取得
+            # threads=True で高速化
+            data = yf.download(
+                batch, 
+                start=start_str, 
+                end=end_str, 
+                interval="1d", 
+                group_by='ticker', 
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
+
+            records = []
+            for ticker in batch:
+                if ticker not in data: continue
+                
+                # 単一銘柄取得時と複数銘柄取得時でDataFrameの構造が変わるためケア
+                if len(batch) == 1:
+                    df_t = data.dropna(how="all")
+                else:
+                    df_t = data[ticker].dropna(how="all")
+                
+                for timestamp, row in df_t.iterrows():
+                    # 欠損値チェック
+                    if pd.isna(row["Close"]): continue
+                    
+                    records.append({
+                        "ticker": ticker.replace(".T", ""),
+                        "date": timestamp.date(),
+                        "open": float(row["Open"]),
+                        "high": float(row["High"]),
+                        "low": float(row["Low"]),
+                        "price": float(row["Close"]),
+                        "volume": int(row["Volume"])
+                    })
             
-            # Yahooへの連続アクセス負荷を考慮して少し待機
-            time.sleep(3)
+            # DBへバルクインサート
+            if records:
+                db.save_prices(pd.DataFrame(records))
+                print(f"✅ {len(batch)}銘柄分 ({len(records)}レコード) 保存完了")
+            else:
+                print(f"⚠️ {batch} のデータが見つかりませんでした")
 
-    print(f"\n🎉 同期完了！DBを確認してください。")
+        except Exception as e:
+            print(f"❌ エラー発生 (Batch {i}): {e}")
+            time.sleep(10) # エラー時は少し長めに待機
+        
+        # サーバーに優しく（村田さんのIPがBANされないように）
+        time.sleep(1.5)
+
+    print("\n✨ 3年間の全ヒストリカルデータ同期が完了しました！")
 
 if __name__ == "__main__":
-    sync_data()
+    sync_data_3years()
