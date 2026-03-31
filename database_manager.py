@@ -1,6 +1,21 @@
+"""
+database_manager.py
+===================
+PostgreSQL（Supabase）との接続・データ操作を担当するモジュール。
+
+【Gemini レビュー反映点】
+  - save_prices に chunksize=1000 の分割 INSERT を追加
+    → Supabase の Statement Timeout 対策
+    → 大量バッチ保存（5日分 × 全銘柄 ≒ 2万件以上）でもタイムアウトしない
+"""
+
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
+
+# Supabase への INSERT を分割する単位（行数）
+# 環境変数 DB_CHUNK_SIZE で上書き可能（デフォルト 1000 行）
+_DB_CHUNK_SIZE = int(os.getenv("DB_CHUNK_SIZE", "1000"))
 
 
 class DBManager:
@@ -8,7 +23,15 @@ class DBManager:
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
             raise RuntimeError("DATABASE_URL が設定されていません")
-        self.engine = create_engine(db_url)
+        self.engine = create_engine(
+            db_url,
+            pool_pre_ping=True,        # 接続の生存確認（長時間実行時の切断対策）
+            pool_recycle=1800,         # 30 分で接続を再作成（Supabase の接続タイムアウト対策）
+            connect_args={
+                "connect_timeout": 30, # 接続タイムアウト 30 秒
+                "options": "-c statement_timeout=60000"  # クエリタイムアウト 60 秒
+            },
+        )
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -18,6 +41,7 @@ class DBManager:
         """
         daily_prices テーブルが存在しない場合のみ作成する。
         (ticker, date) を PRIMARY KEY にすることで重複を DB レベルで防ぐ。
+        ticker は 4桁.T 形式（例: "3048.T"）で統一。
         """
         ddl = """
         CREATE TABLE IF NOT EXISTS daily_prices (
@@ -37,18 +61,23 @@ class DBManager:
             conn.execute(text(ddl))
 
     # ------------------------------------------------------------------
-    # データ保存（差分 upsert）
+    # データ保存（差分 upsert + 分割 INSERT）
     # ------------------------------------------------------------------
     def save_prices(self, df: pd.DataFrame):
         """
         (ticker, date) が重複する場合は何もしない (ON CONFLICT DO NOTHING)。
         初回大量投入も毎日差分投入もこれ一本で対応できる。
+
+        【Gemini 指摘反映】
+        _DB_CHUNK_SIZE 行ずつ分割して INSERT することで
+        Supabase の Statement Timeout を回避する。
         """
         if df.empty:
             print("⚠️ 保存対象のデータが空です。スキップします。")
             return
 
-        rows = df[["ticker", "date", "open", "high", "low", "price", "volume"]].to_dict(orient="records")
+        required = ["ticker", "date", "open", "high", "low", "price", "volume"]
+        rows     = df[required].to_dict(orient="records")
 
         insert_sql = text("""
             INSERT INTO daily_prices (ticker, date, open, high, low, price, volume)
@@ -56,10 +85,17 @@ class DBManager:
             ON CONFLICT (ticker, date) DO NOTHING
         """)
 
+        total_inserted = 0
         try:
-            with self.engine.begin() as conn:
-                conn.execute(insert_sql, rows)
-            print(f"✅ DB保存完了: {len(rows)} 件（重複はスキップ）")
+            # chunksize 行ずつ分割して INSERT（Supabase タイムアウト対策）
+            for i in range(0, len(rows), _DB_CHUNK_SIZE):
+                chunk = rows[i : i + _DB_CHUNK_SIZE]
+                with self.engine.begin() as conn:
+                    conn.execute(insert_sql, chunk)
+                total_inserted += len(chunk)
+
+            print(f"✅ DB保存完了: {total_inserted:,} 件（重複はスキップ）")
+
         except Exception as e:
             print(f"❌ DB保存エラー: {e}")
             raise
@@ -70,7 +106,7 @@ class DBManager:
     def get_latest_saved_date(self) -> str | None:
         """
         daily_prices に保存されている最新の date を返す。
-        1件もない場合は None を返す。
+        1 件もない場合は None を返す。
         """
         query = text("SELECT MAX(date) AS max_date FROM daily_prices")
         with self.engine.connect() as conn:
@@ -84,12 +120,10 @@ class DBManager:
     # ------------------------------------------------------------------
     def load_analysis_data(self, days: int = 150) -> pd.DataFrame:
         """
-        最新日を基準に直近 N 営業日分の全銘柄データをロードする。
+        最新日を基準に直近 N 日以内の全銘柄データをロードする。
 
-        ポイント:
-          - LIMIT を使わず「日付の範囲」で絞ることで、
-            全銘柄 × N 日分を正しく取得できる。
-          - days=150 なら 約150営業日 × 全銘柄 が対象になる。
+        LIMIT を使わず「日付の範囲」で絞ることで、
+        全銘柄 × N 日分を正しく取得できる。
         """
         query = text("""
             WITH latest AS (
@@ -117,7 +151,7 @@ class DBManager:
                 print("⚠️ DBにデータがありません。先にデータ取得を実行してください。")
             else:
                 tickers = df["ticker"].nunique()
-                print(f"📖 DBロード完了: {tickers} 銘柄 × {len(df)} 件（直近 {days} 日以内）")
+                print(f"📖 DBロード完了: {tickers:,} 銘柄 × {len(df):,} 件（直近 {days} 日以内）")
             return df
         except Exception as e:
             print(f"❌ データ読み込みエラー: {e}")
@@ -127,9 +161,7 @@ class DBManager:
     # 特定銘柄の全期間データをロード（バックテスト用）
     # ------------------------------------------------------------------
     def load_ticker_data(self, ticker: str) -> pd.DataFrame:
-        """
-        特定の銘柄の全期間データを返す。バックテストで使う。
-        """
+        """特定の銘柄の全期間データを返す。バックテストで使う。"""
         query = text("""
             SELECT ticker, date, open, high, low, price, volume
             FROM daily_prices
