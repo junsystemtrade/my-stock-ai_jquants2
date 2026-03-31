@@ -7,19 +7,25 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04 # 2026年の標準OS
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12' # 最新の安定版Python
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          # google-generativeai ではなく最新の google-genai をインストール
-          pip install pandas yfinance sqlalchemy psycopg2-binary requests google-genai
+          python -m pip install --upgrade pip
+          # requirements.txt があればそれを使用、なければ個別にインストール
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas yfinance sqlalchemy psycopg2-binary requests google-generativeai xlrd openpyxl
+          fi
 
       - name: Run Sync and Analysis
         env:
@@ -27,6 +33,7 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          JQUANTS_MIN_INTERVAL_SEC: 13
         run: |
           # 1. J-Quants V2からデータを取得してSupabaseへ保存
           python -c "import portfolio_manager; portfolio_manager.sync_data()"
