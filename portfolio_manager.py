@@ -1,8 +1,8 @@
 """
 portfolio_manager.py
 ====================
-株価データの取得・DB同期を担当するモジュール。
-2年分（約500営業日）を一気にバックフィルする特別仕様。
+株価データの取得・DB同期を担当。
+【一括モード】2年分のデータを強制的にバックフィルします。
 """
 
 import io
@@ -19,12 +19,9 @@ import database_manager
 # -----------------------------------------------------------------------
 BASE_API          = "https://api.jquants.com/v2"
 EQ_DAILY_ENDPOINT = "/equities/bars/daily"
-BACKFILL_YEARS    = 2          # 2年分を一括取得対象にする
+BACKFILL_YEARS    = 2          # ターゲット期間
 SAMPLE_CODE       = "30480"    # ビックカメラ
 
-# -----------------------------------------------------------------------
-# レートリミッター（Free プラン: 13 秒間隔）
-# -----------------------------------------------------------------------
 class RateLimiter:
     def __init__(self, min_interval_sec: float = 13.0):
         self.min_interval = float(min_interval_sec)
@@ -37,9 +34,6 @@ class RateLimiter:
             time.sleep(self.min_interval - elapsed)
         self._last = time.monotonic()
 
-# -----------------------------------------------------------------------
-# JPX 上場銘柄マスタ取得
-# -----------------------------------------------------------------------
 def get_target_tickers() -> dict:
     from bs4 import BeautifulSoup
     base_url  = "https://www.jpx.co.jp"
@@ -62,11 +56,8 @@ def get_target_tickers() -> dict:
         return stock_map
     except Exception as e:
         print(f"❌ JPX銘柄マスタ取得失敗: {e}")
-        return {"30480.T": {"name": "ビックカメラ"}} # 最悪のフォールバック
+        return {"30480.T": {"name": "ビックカメラ"}}
 
-# -----------------------------------------------------------------------
-# J-Quants ヘルパー
-# -----------------------------------------------------------------------
 def _jquants_headers(api_key: str) -> dict:
     return {"x-api-key": api_key, "Accept": "application/json"}
 
@@ -88,8 +79,7 @@ def _jquants_fetch_day(api_key: str, date_str: str, limiter: RateLimiter) -> lis
         limiter.wait()
         r = requests.get(url, headers=_jquants_headers(api_key), params=params, timeout=30)
         if r.status_code == 429:
-            time.sleep(60)
-            continue
+            time.sleep(60); continue
         if r.status_code == 400: return []
         r.raise_for_status()
         payload = r.json()
@@ -106,9 +96,6 @@ def _jquants_rows_to_df(rows: list[dict]) -> pd.DataFrame:
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
     return df[["ticker", "date", "open", "high", "low", "price", "volume"]].reset_index(drop=True)
 
-# -----------------------------------------------------------------------
-# Yahoo Finance フォールバック
-# -----------------------------------------------------------------------
 def _yahoo_fetch_range(tickers: list[str], start: str, end: str) -> pd.DataFrame:
     if not tickers: return pd.DataFrame()
     print(f"📡 Yahoo Finance 取得中... ({start})")
@@ -120,7 +107,7 @@ def _yahoo_fetch_range(tickers: list[str], start: str, end: str) -> pd.DataFrame
                 df_t = raw[ticker].dropna(how="all")
                 for idx, row in df_t.iterrows():
                     records.append({
-                        "ticker": ticker, "date": idx.date(),
+                        "ticker": ticker.replace(".T", ""), "date": idx.date(),
                         "open": row.get("Open"), "high": row.get("High"),
                         "low": row.get("Low"), "price": row.get("Close"),
                         "volume": row.get("Volume"),
@@ -140,33 +127,30 @@ def _business_days(start: date, end: date) -> list[date]:
     return days
 
 # -----------------------------------------------------------------------
-# メイン同期関数
+# メイン同期関数（強制バックフィル仕様）
 # -----------------------------------------------------------------------
 def sync_data():
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
     db = database_manager.DBManager()
     limiter = RateLimiter(min_interval_sec=float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "13")))
 
-    print("🔍 ステータス確認中...")
+    print("🔍 データ同期プロセス開始...")
     jquants_latest = _jquants_latest_accessible_date(api_key, limiter)
-    db_latest_str = db.get_latest_saved_date()
-
-    if db_latest_str is None:
-        start_date = jquants_latest - timedelta(days=BACKFILL_YEARS * 365)
-        print(f"🚀 2年分一括バックフィル開始: {start_date} 〜 {jquants_latest}")
-    else:
-        start_date = date.fromisoformat(db_latest_str) + timedelta(days=1)
-        print(f"🔄 差分更新開始: {start_date} 〜 {jquants_latest}")
+    
+    # 【重要】開始日を「今日から2年前」に固定して、全日程をチェックする
+    start_date = jquants_latest - timedelta(days=BACKFILL_YEARS * 365)
+    print(f"🚀 【強制モード】2年分バックフィル実行中: {start_date} 〜 {jquants_latest}")
 
     target_days = _business_days(start_date, jquants_latest)
-    print(f"📅 合計対象日数: {len(target_days)} 日")
+    print(f"📅 合計チェック日数: {len(target_days)} 日")
 
     ticker_map = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
-    saved_total = 0
 
     for target_date in target_days:
         d_str = target_date.strftime("%Y-%m-%d")
+        
+        # まず J-Quants を試す
         rows = _jquants_fetch_day(api_key, d_str, limiter)
         
         if rows:
@@ -174,16 +158,17 @@ def sync_data():
             db.save_prices(df)
             print(f"✅ {d_str}: J-Quants {len(df)} 件保存")
         else:
-            # Freeプラン範囲外などは Yahoo Finance
+            # 12週間より前などは Yahoo Finance で補完
             yf_end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
             df_yf = _yahoo_fetch_range(all_yf_tickers, d_str, yf_end)
             if not df_yf.empty:
                 db.save_prices(df_yf)
                 print(f"✅ {d_str}: Yahoo Finance {len(df_yf)} 件保存")
-            # Yahooへの連続負荷軽減
-            time.sleep(5)
+            
+            # Yahooへの連続アクセス負荷を考慮して少し待機
+            time.sleep(3)
 
-    print(f"\n🎉 完了！ 2年分の土台が整いました。")
+    print(f"\n🎉 同期完了！DBを確認してください。")
 
 if __name__ == "__main__":
     sync_data()
