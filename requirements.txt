@@ -9,13 +9,13 @@ requests
 yfinance
 beautifulsoup4
 openpyxl
+xlrd>=2.0.1      # JPX銘柄マスタ（.xls形式）の読み込みに必要
 
 # データ処理
 pandas
 numpy
 
-# Gemini AI（新公式SDK: google-genai）
-# google-generativeai は2025年11月にサポート終了 → google-genai に移行
+# Gemini AI（新公式SDK）
 google-genai
 
 # 設定ファイル
