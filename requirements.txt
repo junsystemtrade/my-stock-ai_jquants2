@@ -1,3 +1,5 @@
+# requirements.txt
+
 # DB
 sqlalchemy>=2.0
 psycopg2-binary
@@ -12,7 +14,8 @@ openpyxl
 pandas
 numpy
 
-# Gemini AI（新公式SDK）
+# Gemini AI（新公式SDK: google-genai）
+# google-generativeai は2025年11月にサポート終了 → google-genai に移行
 google-genai
 
 # 設定ファイル
