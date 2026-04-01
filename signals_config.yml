@@ -2,38 +2,43 @@
 # ==================
 # シグナル条件の設定ファイル。
 # コードを変更せずにここだけ編集してチューニングできます。
-# GitHub Actions の workflow からも参照されます。
 
 signals:
 
   # ---- ① ゴールデンクロス ----
-  # 短期移動平均が長期移動平均を下から上抜けした日
   golden_cross:
     enabled: true
-    short_window: 25   # 短期MA の日数
-    long_window:  75   # 長期MA の日数
+    short_window: 25
+    long_window:  75
 
   # ---- ② RSI 売られすぎ ----
-  # RSI が閾値を下回ったとき（反発を期待する局面）
   rsi_oversold:
     enabled: true
-    window:    14   # RSI の計算期間
-    threshold: 30   # この値を下回ったらシグナル
+    window:    14
+    threshold: 30
 
   # ---- ③ 出来高急増 ----
-  # 当日出来高が直近 N 日平均の X 倍を超えたとき
   volume_surge:
     enabled: true
-    window:     20   # 平均出来高の計算期間（日）
-    multiplier: 2.0  # 何倍を超えたらシグナルとするか
+    window:     20
+    multiplier: 2.0
 
 filter:
-  min_price:     200    # 対象銘柄の最低株価（円）
-  max_price:   50000    # 対象銘柄の最高株価（円）
-  min_data_days:  80    # シグナル計算に必要な最低データ日数
+  # 価格フィルター（低価格すぎる銘柄・高価格すぎる銘柄を除外）
+  min_price:      500    # 500円未満は除外（ETFや低位株が多い）
+  max_price:   50000     # 5万円超は除外
+  min_data_days:  80     # 計算に必要な最低データ日数
+
+  # ETF・REIT・インフラファンド除外
+  # 証券コード 1000〜1999 は ETF・ETN・REIT が集中しているため除外
+  exclude_code_range:
+    - [1000, 1999]   # ETF・ETN・REIT・インフラファンド
+
+  # 1銘柄あたりの最大通知シグナル数（複数シグナルが重複するのを防ぐ）
+  max_signals_per_ticker: 1
 
 backtest:
-  hold_days:       10   # シグナル後の最大保有日数
-  stop_loss_pct:   5.0  # ストップロス（%）。この下落で強制エグジット
-  initial_capital: 1000000  # 仮想初期資金（円）
-  position_size:   0.1  # 1トレードに使う資金割合（0.1 = 10%）
+  hold_days:       10
+  stop_loss_pct:   5.0
+  initial_capital: 1000000
+  position_size:   0.1
