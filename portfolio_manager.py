@@ -3,18 +3,29 @@ portfolio_manager.py
 ====================
 株価データの取得・DB 同期を担当するモジュール。
 
+【高速化の方針】
+  Yahoo Finance を主軸に据えることで大幅に高速化する。
+
+  J-Quants Free プランは 5 req/min のレート制限があり、
+  全銘柄 × 3年分を取得すると 6〜8 時間かかる。
+
+  Yahoo Finance は 1 リクエストで複数銘柄 × 複数年分を
+  一括取得できるため、同じデータを 30〜60 分で取得可能。
+
 【動作モード】
   sync_data():
-    毎日の差分取得。DB最終日の翌日〜今日を取得。
-    daily_scan workflow から呼ばれる。
+    毎日の差分取得。daily_scan.yml から呼ばれる。
+    DB最終日の翌日〜今日を Yahoo Finance で高速取得。
 
   backfill_data():
-    初回バックフィル。DB最古日より前を過去に向かって掘り下げる。
-    3年分に満たない場合に Initial Backfill workflow から呼ばれる。
-    チェックポイント方式で途中再開可能。
+    Initial Backfill workflow から呼ばれる。
+    DB最古日より前を Yahoo Finance で一括高速取得。
+    3年分を 30〜60 分で完了させる。
 
-  直接実行（python portfolio_manager.py）:
-    backfill_data() を実行する。
+【所要時間の目安】
+  Yahoo Finance: 100銘柄/チャンク × 4000銘柄 = 40チャンク × 3秒 = 約2分/日
+  ただし3年分をまとめて取るので: 40チャンク × 3秒 = 約2分で3年分完了
+  → 合計 30〜60 分（J-Quants の 1/10 以下）
 """
 
 import io
@@ -32,15 +43,23 @@ import database_manager
 # -----------------------------------------------------------------------
 # 定数
 # -----------------------------------------------------------------------
+BACKFILL_YEARS = 3
+
+# Yahoo Finance チャンクサイズ（1リクエストあたりの銘柄数）
+# 大きすぎるとタイムアウトするので 50 が安定
+_YF_CHUNK_SIZE = int(os.getenv("YF_CHUNK_SIZE", "50"))
+
+# Yahoo Finance チャンク間の待機秒数
+_YF_SLEEP = float(os.getenv("YF_SLEEP_SEC", "3.0"))
+
+# DB INSERT の分割単位（Supabase タイムアウト対策）
+_DB_CHUNK_SIZE = int(os.getenv("DB_CHUNK_SIZE", "1000"))
+
+# J-Quants（最新日確認のみに使用）
 BASE_API          = "https://api.jquants.com/v2"
 EQ_DAILY_ENDPOINT = "/equities/bars/daily"
-BACKFILL_YEARS    = 3
 _SAMPLE_CODES     = ["72030", "86580", "90840", "30480"]
 _JQUANTS_INTERVAL = float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "12.5"))
-_BATCH_DAYS       = int(os.getenv("BATCH_DAYS", "5"))
-_DB_CHUNK_SIZE    = int(os.getenv("DB_CHUNK_SIZE", "1000"))
-_YF_CHUNK_SIZE    = int(os.getenv("YF_CHUNK_SIZE", "100"))
-_YF_SLEEP         = float(os.getenv("YF_SLEEP_SEC", "2.0"))
 
 
 # -----------------------------------------------------------------------
@@ -48,21 +67,6 @@ _YF_SLEEP         = float(os.getenv("YF_SLEEP_SEC", "2.0"))
 # -----------------------------------------------------------------------
 def _today_jst() -> date:
     return datetime.now(ZoneInfo("Asia/Tokyo")).date()
-
-
-# -----------------------------------------------------------------------
-# レートリミッター
-# -----------------------------------------------------------------------
-class RateLimiter:
-    def __init__(self, min_interval_sec: float = _JQUANTS_INTERVAL):
-        self.min_interval = min_interval_sec
-        self._last        = 0.0
-
-    def wait(self):
-        elapsed = time.monotonic() - self._last
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last = time.monotonic()
 
 
 # -----------------------------------------------------------------------
@@ -74,7 +78,6 @@ def _to_yf_ticker(code: str) -> str:
         code_only = code_only[:4]
     return f"{code_only}.T"
 
-
 def _to_db_ticker(yf_ticker: str) -> str:
     return _to_yf_ticker(yf_ticker)
 
@@ -83,6 +86,10 @@ def _to_db_ticker(yf_ticker: str) -> str:
 # JPX 上場銘柄マスタ取得
 # -----------------------------------------------------------------------
 def get_target_tickers() -> dict:
+    """
+    JPX の上場銘柄一覧を取得し {yf_ticker: {"name": str}} を返す。
+    ticker は Yahoo Finance 形式（4桁.T）に統一。
+    """
     try:
         import jpx_master
         raw = jpx_master.get_target_tickers()
@@ -106,7 +113,12 @@ def get_target_tickers() -> dict:
 
         excel_url = base_url + link["href"]
         resp      = requests.get(excel_url, headers=headers, timeout=60)
-        df        = pd.read_excel(io.BytesIO(resp.content))
+
+        if excel_url.endswith(".xlsx"):
+            df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
+        else:
+            df = pd.read_excel(io.BytesIO(resp.content), engine="xlrd")
+
         df.columns = [str(c).strip() for c in df.columns]
 
         stock_map = {}
@@ -125,23 +137,39 @@ def get_target_tickers() -> dict:
 
 
 # -----------------------------------------------------------------------
-# J-Quants API ヘルパー
+# J-Quants: 最新日確認のみ（レート制限対応）
 # -----------------------------------------------------------------------
-def _jq_headers(api_key: str) -> dict:
-    return {"x-api-key": api_key, "Accept": "application/json"}
+class _RateLimiter:
+    def __init__(self, min_interval_sec: float = _JQUANTS_INTERVAL):
+        self.min_interval = min_interval_sec
+        self._last        = 0.0
+
+    def wait(self):
+        elapsed = time.monotonic() - self._last
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self._last = time.monotonic()
 
 
-def _jq_latest_date(api_key: str, limiter: RateLimiter) -> date | None:
-    """J-Quants で取得できる最新日を返す。"""
-    url       = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-    best_date = None
+def _jq_latest_date() -> date | None:
+    """
+    J-Quants から取得可能な最新日を確認する。
+    データ取得には使わず、日付の確認のみに利用。
+    """
+    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    url     = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
+    limiter = _RateLimiter()
+    best    = None
 
     for code in _SAMPLE_CODES:
         try:
             limiter.wait()
             r = requests.get(
                 url,
-                headers=_jq_headers(api_key),
+                headers={"x-api-key": api_key, "Accept": "application/json"},
                 params={"code": code},
                 timeout=30,
             )
@@ -151,114 +179,49 @@ def _jq_latest_date(api_key: str, limiter: RateLimiter) -> date | None:
             if not data:
                 continue
             d = pd.to_datetime(data[-1]["Date"]).date()
-            print(f"  📌 code={code}: 最新日 {d}")
-            if best_date is None or d > best_date:
-                best_date = d
-        except Exception as e:
-            print(f"  ⚠️ code={code} 取得失敗: {e}")
-
-    return best_date
-
-
-def _jq_earliest_date(api_key: str, limiter: RateLimiter) -> date | None:
-    """J-Quants で取得できる最古日を返す。"""
-    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-
-    for code in _SAMPLE_CODES:
-        try:
-            limiter.wait()
-            r = requests.get(
-                url,
-                headers=_jq_headers(api_key),
-                params={"code": code},
-                timeout=30,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json().get("data", [])
-            if not data:
-                continue
-            d = pd.to_datetime(data[0]["Date"]).date()
-            print(f"  📌 code={code}: 最古日 {d}")
-            return d
-        except Exception as e:
-            print(f"  ⚠️ code={code} 取得失敗: {e}")
-
-    return None
-
-
-def _jq_fetch_day(api_key: str, date_str: str, limiter: RateLimiter) -> list[dict]:
-    url            = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-    rows: list     = []
-    pagination_key = None
-
-    while True:
-        params = {"date": date_str}
-        if pagination_key:
-            params["pagination_key"] = pagination_key
-
-        limiter.wait()
-        r = requests.get(
-            url,
-            headers=_jq_headers(api_key),
-            params=params,
-            timeout=30,
-        )
-
-        if r.status_code == 429:
-            retry_after = int(r.headers.get("Retry-After", "60"))
-            print(f"  ⚠️ 429 → {retry_after}秒待機")
-            time.sleep(retry_after)
+            print(f"  📌 J-Quants code={code}: 最新日 {d}")
+            if best is None or d > best:
+                best = d
+        except Exception:
             continue
 
-        if r.status_code in (400, 403, 500, 503):
-            return []
-
-        r.raise_for_status()
-
-        payload        = r.json()
-        rows.extend(payload.get("data", []))
-        pagination_key = payload.get("pagination_key")
-        if not pagination_key:
-            break
-
-    return rows
-
-
-def _jq_rows_to_df(rows: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame(rows)
-    df["date"]   = pd.to_datetime(df["Date"]).dt.date
-    df["ticker"] = df["Code"].astype(str).apply(lambda c: f"{c[:4]}.T")
-
-    col_map = {"O": "open", "H": "high", "L": "low", "C": "price", "Vo": "volume"}
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-
-    required = ["ticker", "date", "open", "high", "low", "price", "volume"]
-    missing  = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"J-Quants レスポンスに必要カラムなし: {missing}")
-
-    return (
-        df[required]
-        .drop_duplicates(subset=["ticker", "date"])
-        .sort_values(["date", "ticker"])
-        .reset_index(drop=True)
-    )
+    return best
 
 
 # -----------------------------------------------------------------------
-# Yahoo Finance フォールバック
+# Yahoo Finance 一括取得（メインのデータソース）
 # -----------------------------------------------------------------------
-def _yf_fetch_range(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+def _yf_fetch_bulk(
+    tickers: list[str],
+    start: str,
+    end: str,
+    label: str = "",
+) -> pd.DataFrame:
+    """
+    Yahoo Finance から start〜end の全銘柄データを一括取得。
+
+    【高速化のポイント】
+    - 1リクエストで複数銘柄・複数年分を取得（J-Quantsと違い日付ループ不要）
+    - _YF_CHUNK_SIZE 銘柄ずつ分割してタイムアウトを防ぐ
+    - threads=True で内部並列取得
+
+    tickers : ["3048.T", ...] 形式
+    start   : "YYYY-MM-DD"
+    end     : "YYYY-MM-DD"（取得したい最終日の翌日）
+    """
     if not tickers:
         return pd.DataFrame()
 
     all_records = []
     total       = len(tickers)
+    n_chunks    = (total + _YF_CHUNK_SIZE - 1) // _YF_CHUNK_SIZE
+
+    print(f"📡 Yahoo Finance 一括取得: {total} 銘柄 / {start}〜{end} / {n_chunks}チャンク")
 
     for i in range(0, total, _YF_CHUNK_SIZE):
-        chunk = tickers[i : i + _YF_CHUNK_SIZE]
-        print(f"  📡 Yahoo Finance: {i+1}〜{min(i+_YF_CHUNK_SIZE, total)}/{total} 銘柄")
+        chunk    = tickers[i : i + _YF_CHUNK_SIZE]
+        chunk_no = i // _YF_CHUNK_SIZE + 1
+        print(f"  チャンク {chunk_no}/{n_chunks} ({len(chunk)}銘柄)", end=" ... ", flush=True)
 
         try:
             raw = yf.download(
@@ -270,17 +233,19 @@ def _yf_fetch_range(tickers: list[str], start: str, end: str) -> pd.DataFrame:
                 progress=False,
                 group_by="ticker",
                 threads=True,
-                timeout=30,
+                timeout=60,
             )
         except Exception as e:
-            print(f"  ❌ チャンク取得失敗: {e}")
-            time.sleep(_YF_SLEEP)
+            print(f"❌ 失敗: {e}")
+            time.sleep(_YF_SLEEP * 2)
             continue
 
         if raw is None or raw.empty:
+            print("空データ")
             time.sleep(_YF_SLEEP)
             continue
 
+        chunk_records = 0
         for ticker in chunk:
             try:
                 if isinstance(raw.columns, pd.MultiIndex):
@@ -301,213 +266,200 @@ def _yf_fetch_range(tickers: list[str], start: str, end: str) -> pd.DataFrame:
                         "price":  float(close),
                         "volume": int(row["Volume"])   if pd.notna(row.get("Volume")) else None,
                     })
+                    chunk_records += 1
             except (KeyError, TypeError):
                 continue
 
+        print(f"✅ {chunk_records:,}件")
         time.sleep(_YF_SLEEP)
 
     if not all_records:
         return pd.DataFrame()
 
-    return (
+    df_out = (
         pd.DataFrame(all_records)
         .drop_duplicates(subset=["ticker", "date"])
+        .sort_values(["ticker", "date"])
         .reset_index(drop=True)
     )
+    print(f"  合計: {len(df_out):,} 件取得")
+    return df_out
 
 
 # -----------------------------------------------------------------------
 # 日付ユーティリティ
 # -----------------------------------------------------------------------
-def _business_days(start: date, end: date) -> list[date]:
-    days = []
-    d    = start
-    while d <= end:
-        if d.weekday() < 5:
-            days.append(d)
-        d += timedelta(days=1)
-    return days
+def _prev_business_day(d: date) -> date:
+    """指定日の前営業日を返す。"""
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
 
 # -----------------------------------------------------------------------
-# 共通取得・保存ロジック
+# 通常差分同期（daily_scan.yml から呼ばれる）
 # -----------------------------------------------------------------------
-def _fetch_and_save(
-    target_days: list[date],
-    api_key: str,
-    jq_latest: date,
-    db: database_manager.DBManager,
-    limiter: RateLimiter,
-    all_yf_tickers: list[str],
-    mode: str = "同期",
-):
-    total_days   = len(target_days)
-    saved_total  = 0
-    batch_buffer = []
-    skipped_days = []
+def sync_data():
+    """
+    DB の最終保存日の翌日〜今日を差分取得して保存する。
+    Yahoo Finance で高速一括取得。
+    """
+    db = database_manager.DBManager()
 
-    for idx, target_date in enumerate(target_days, 1):
-        d_str    = target_date.strftime("%Y-%m-%d")
-        progress = f"[{idx}/{total_days}]"
+    # J-Quants 最新日確認（ログ用）
+    print("🔍 J-Quants 最新日を確認中（参考情報）...")
+    jq_latest = _jq_latest_date()
+    if jq_latest:
+        print(f"✅ J-Quants 最新日: {jq_latest}")
 
-        print(f"{progress} 📥 {d_str}", end="  ", flush=True)
+    # 取得すべき最終日（前営業日）
+    target_end = _prev_business_day(_today_jst())
 
-        if target_date <= jq_latest:
-            rows = _jq_fetch_day(api_key, d_str, limiter)
-            if rows:
-                df = _jq_rows_to_df(rows)
-                batch_buffer.append(df)
-                print(f"✅ J-Quants {len(df):,}件")
-            else:
-                print(f"⚠️ J-Quants空 → Yahoo Finance補完中...")
-                yf_end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-                df_yf  = _yf_fetch_range(all_yf_tickers, d_str, yf_end)
-                if not df_yf.empty:
-                    batch_buffer.append(df_yf)
-                    print(f"  ✅ Yahoo Finance {len(df_yf):,}件")
-                else:
-                    skipped_days.append(d_str)
-                    print(f"  ℹ️ データなし → スキップ")
-        else:
-            print(f"📡 Yahoo Finance（J-Quants範囲外）", end="  ", flush=True)
-            yf_end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            df_yf  = _yf_fetch_range(all_yf_tickers, d_str, yf_end)
-            if not df_yf.empty:
-                batch_buffer.append(df_yf)
-                print(f"✅ {len(df_yf):,}件")
-            else:
-                skipped_days.append(d_str)
-                print(f"ℹ️ データなし → スキップ")
+    # DB 最終日確認
+    db_latest_str = db.get_latest_saved_date()
+    if db_latest_str is None:
+        print("⚠️ DBにデータがありません。Initial Backfill を先に実行してください。")
+        return
 
-        if len(batch_buffer) >= _BATCH_DAYS:
-            combined     = pd.concat(batch_buffer, ignore_index=True)
-            db.save_prices(combined)
-            saved_total  += len(combined)
-            batch_buffer  = []
-            print(f"  💾 バッチ保存: 累計 {saved_total:,} 件")
+    db_latest  = date.fromisoformat(db_latest_str)
+    start_date = db_latest + timedelta(days=1)
 
-    if batch_buffer:
-        combined     = pd.concat(batch_buffer, ignore_index=True)
-        db.save_prices(combined)
-        saved_total += len(combined)
-        print(f"\n💾 最終バッチ保存: {len(combined):,} 件")
+    if start_date > target_end:
+        print(f"✅ DB はすでに最新です（最終日: {db_latest}）。スキップします。")
+        return
+
+    diff_days = (target_end - db_latest).days
+    print(f"🔄 差分取得: {start_date} 〜 {target_end}（{diff_days}日分）")
+
+    # Yahoo Finance で一括取得
+    ticker_map     = get_target_tickers()
+    all_yf_tickers = list(ticker_map.keys())
+
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str   = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    df = _yf_fetch_bulk(all_yf_tickers, start_str, end_str, label="差分")
+
+    if df.empty:
+        print("⚠️ データが取得できませんでした。")
+        return
+
+    db.save_prices(df)
 
     print(f"\n{'='*40}")
-    print(f"🎉 {mode} 完了")
-    print(f"   保存件数  : {saved_total:,} 件")
-    print(f"   取得日数  : {total_days} 営業日")
-    if skipped_days:
-        print(f"   スキップ  : {len(skipped_days)} 日（祝日等）")
+    print(f"🎉 差分同期完了: {len(df):,} 件保存")
     print(f"{'='*40}")
 
 
 # -----------------------------------------------------------------------
-# 差分同期（毎日の定期実行）
-# -----------------------------------------------------------------------
-def sync_data():
-    """DB の最終日の翌日〜今日を差分取得する。"""
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("JQUANTS_API_KEY が設定されていません")
-
-    db      = database_manager.DBManager()
-    limiter = RateLimiter()
-
-    print("🔍 J-Quants 取得可能最新日を確認中...")
-    jq_latest = _jq_latest_date(api_key, limiter)
-    if jq_latest:
-        print(f"✅ J-Quants 最新日: {jq_latest}")
-    else:
-        jq_latest = date(2000, 1, 1)
-
-    today      = _today_jst()
-    target_end = today - timedelta(days=1)
-    while target_end.weekday() >= 5:
-        target_end -= timedelta(days=1)
-
-    db_latest_str = db.get_latest_saved_date()
-
-    if db_latest_str is None:
-        start_date = target_end - timedelta(days=7)
-        print(f"\n⚠️ DBが空です。直近7日分のみ取得します。")
-    else:
-        db_latest  = date.fromisoformat(db_latest_str)
-        start_date = db_latest + timedelta(days=1)
-        if start_date > target_end:
-            print(f"✅ DB はすでに最新です（最終日: {db_latest}）。スキップします。")
-            return
-        print(f"\n🔄 差分取得: {start_date} 〜 {target_end}")
-
-    target_days    = _business_days(start_date, target_end)
-    ticker_map     = get_target_tickers()
-    all_yf_tickers = list(ticker_map.keys())
-
-    _fetch_and_save(target_days, api_key, jq_latest, db, limiter, all_yf_tickers, mode="差分同期")
-
-
-# -----------------------------------------------------------------------
-# バックフィル（過去に向かって掘り下げる）
+# バックフィル専用（Initial Backfill workflow から呼ばれる）
 # -----------------------------------------------------------------------
 def backfill_data():
     """
-    DBの最古日より前を過去に向かって掘り下げる。
-    3年分揃うまで何度でも続きから再開できる。
+    DB 最古日より前を過去に向かって一括取得する。
+    Yahoo Finance を使うことで J-Quants の 1/10 以下の時間で完了。
+
+    【所要時間目安】
+    4000銘柄 / 50銘柄チャンク = 80チャンク × 3秒 = 約4分
+    ただし Yahoo Finance のレート制限により実際は 30〜60 分程度
     """
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("JQUANTS_API_KEY が設定されていません")
+    db = database_manager.DBManager()
 
-    db      = database_manager.DBManager()
-    limiter = RateLimiter()
+    # バックフィルの目標開始日（3年前）
+    today        = _today_jst()
+    target_start = today - timedelta(days=BACKFILL_YEARS * 365)
+    target_end   = _prev_business_day(today)
 
-    print("🔍 J-Quants 取得可能範囲を確認中...")
-    jq_latest   = _jq_latest_date(api_key, limiter)
-    jq_earliest = _jq_earliest_date(api_key, limiter)
-
-    if not jq_latest:
-        print("❌ J-Quants の最新日を取得できませんでした。終了します。")
-        return
-
-    print(f"✅ J-Quants 範囲: {jq_earliest} 〜 {jq_latest}")
-
-    # 目標の開始日（3年前）
-    target_start = jq_latest - timedelta(days=BACKFILL_YEARS * 365)
-    print(f"🎯 目標開始日: {target_start}（{BACKFILL_YEARS}年前）")
-
-    # DB の最古日を確認
+    # DB 状況確認
     db_oldest_str = db.get_oldest_saved_date()
+    db_latest_str = db.get_latest_saved_date()
 
-    if db_oldest_str is None:
-        fetch_end   = jq_latest
-        fetch_start = target_start
-        print(f"\n🆕 初回バックフィル: {fetch_start} 〜 {fetch_end}")
-    else:
-        db_oldest = date.fromisoformat(db_oldest_str)
+    print(f"\n📊 DB 現在の状況:")
+    print(f"   最古日: {db_oldest_str or 'なし'}")
+    print(f"   最終日: {db_latest_str or 'なし'}")
+    print(f"   目標開始日: {target_start}（{BACKFILL_YEARS}年前）")
+
+    # --- 過去方向のバックフィル ---
+    if db_oldest_str is not None:
+        db_oldest     = date.fromisoformat(db_oldest_str)
+        backfill_end  = db_oldest - timedelta(days=1)
+
         if db_oldest <= target_start:
-            print(f"✅ 3年分のデータがすでに揃っています（最古日: {db_oldest}）。")
-            return
-        fetch_end   = db_oldest - timedelta(days=1)
-        fetch_start = target_start
-        print(f"\n🔄 バックフィル続き: {fetch_start} 〜 {fetch_end}（DB最古日: {db_oldest}）")
+            print(f"\n✅ 過去方向: すでに {BACKFILL_YEARS} 年分揃っています。")
+        else:
+            print(f"\n⬅️  過去方向バックフィル: {target_start} 〜 {backfill_end}")
+            _run_bulk_fetch(db, target_start, backfill_end, label="過去")
 
-    target_days = _business_days(fetch_start, fetch_end)
-    total_days  = len(target_days)
-
-    if total_days == 0:
-        print("✅ 取得対象の営業日がありません。")
+    else:
+        # DB が空の場合は全期間取得
+        print(f"\n⬅️  初回バックフィル: {target_start} 〜 {target_end}")
+        _run_bulk_fetch(db, target_start, target_end, label="初回")
         return
 
-    print(f"📅 取得対象: {total_days} 営業日")
-    print(f"⏱ 途中で止まっても次回実行時に続きから再開します\n")
+    # --- 未来方向の差分補完（J-Quants 範囲外 = 2026/1/7 以降）---
+    if db_latest_str is not None:
+        db_latest  = date.fromisoformat(db_latest_str)
+        future_start = db_latest + timedelta(days=1)
+
+        if future_start <= target_end:
+            print(f"\n➡️  未来方向差分補完: {future_start} 〜 {target_end}")
+            _run_bulk_fetch(db, future_start, target_end, label="差分")
+        else:
+            print(f"\n✅ 未来方向: 最終日 {db_latest} はすでに最新です。")
+
+    # 完了確認
+    new_oldest = db.get_oldest_saved_date()
+    new_latest = db.get_latest_saved_date()
+    print(f"\n{'='*40}")
+    print(f"🎉 バックフィル完了")
+    print(f"   DB最古日: {new_oldest}")
+    print(f"   DB最終日: {new_latest}")
+    if new_oldest and date.fromisoformat(new_oldest) <= target_start:
+        print(f"   ✅ {BACKFILL_YEARS}年分のデータが揃いました！")
+    else:
+        print(f"   ⏳ まだ途中です。再度 Initial Backfill を実行してください。")
+    print(f"{'='*40}")
+
+
+def _run_bulk_fetch(
+    db: database_manager.DBManager,
+    start: date,
+    end: date,
+    label: str = "",
+):
+    """指定期間の全銘柄データを Yahoo Finance で一括取得して DB に保存。"""
+    if start > end:
+        print(f"  ⚠️ 取得範囲が逆転しています（{start} > {end}）。スキップ。")
+        return
 
     ticker_map     = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
 
-    _fetch_and_save(target_days, api_key, jq_latest, db, limiter, all_yf_tickers, mode="バックフィル")
+    start_str = start.strftime("%Y-%m-%d")
+    end_str   = (end + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    print(f"  対象銘柄: {len(all_yf_tickers)} 銘柄")
+    print(f"  取得期間: {start_str} 〜 {end_str}\n")
+
+    df = _yf_fetch_bulk(all_yf_tickers, start_str, end_str, label=label)
+
+    if df.empty:
+        print(f"  ⚠️ [{label}] データが取得できませんでした。")
+        return
+
+    # 大量データを分割して保存（Supabase タイムアウト対策）
+    batch_size = 50000  # 5万行ずつ保存
+    for i in range(0, len(df), batch_size):
+        chunk = df.iloc[i : i + batch_size]
+        db.save_prices(chunk)
+        print(f"  💾 保存: {i + len(chunk):,} / {len(df):,} 件")
+
+    print(f"  ✅ [{label}] 合計 {len(df):,} 件保存完了")
 
 
 # -----------------------------------------------------------------------
-# 直接実行時はバックフィルモード
+# エントリーポイント
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
     backfill_data()
