@@ -1,30 +1,46 @@
-name: Stock AI Sync
+# .github/workflows/manual_backtest.yml
+# =======================================
+# バックテストの手動実行 workflow
+# GitHub の Actions タブから手動でトリガーする
+
+name: Manual Backtest
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 9 * * 1-5' # 平日18時(JST)
+    inputs:
+      notify_discord:
+        description: "Discord に結果を通知するか"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04 # 最新OS
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60    # バックテストは時間がかかるため長めに設定
+
+    env:
+      DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+      JQUANTS_API_KEY:     ${{ secrets.JQUANTS_API_KEY }}
+      GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      NOTIFY_DISCORD:      ${{ github.event.inputs.notify_discord }}
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
+      - name: ☁️ リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python セットアップ
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12' # 最新Python
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
-        run: |
-          pip install pandas yfinance sqlalchemy psycopg2-binary requests google-genai
+      - name: 📦 依存パッケージのインストール
+        run: pip install -r requirements.txt
 
-      - name: Run Sync and Analysis
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          python -c "import portfolio_manager; portfolio_manager.sync_data()"
-          python -c "import backtest_engine; backtest_engine.run_backtest_and_report()"
+      - name: 📊 バックテスト実行
+        run: python backtest_engine.py
