@@ -3,12 +3,6 @@ main.py
 =======
 毎日の銘柄スキャン + Discord 通知のエントリーポイント。
 GitHub Actions の daily workflow から呼ばれる。
-
-実行フロー:
-  STEP 1: DB を最新状態に差分同期（portfolio_manager.sync_data）
-  STEP 2: 直近 150 日分のデータを DB からロード
-  STEP 3: テクニカルシグナルをスキャン + Gemini で企業調査（signal_engine.scan_signals）
-  STEP 4: 結果を Discord へ通知
 """
 
 import os
@@ -28,7 +22,6 @@ def send_discord(content: str):
     if not url:
         print("⚠️ DISCORD_WEBHOOK_URL が未設定です。通知をスキップします。")
         return
-    # 2000 文字超は分割送信
     for i in range(0, len(content), 1990):
         chunk = content[i : i + 1990]
         res = requests.post(url, json={"content": chunk})
@@ -76,17 +69,32 @@ def main():
     # STEP 4: Discord 通知
     print("\n--- STEP 4: Discord 通知 ---")
     if signals:
-        report = "🏛️ **【AI投資顧問：銘柄検知速報】**\n"
+        report  = "🏛️ **【AI投資顧問：銘柄検知速報】**\n"
         report += f"📊 本日のシグナル検知: {len(signals)} 件\n"
         report += "━" * 20 + "\n"
+
         for s in signals:
+            ticker       = s["ticker"]
+            company_name = s.get("company_name", ticker.replace(".T", ""))
+            price        = s["price"]
+            signal_type  = s["signal_type"]
+            reason       = s["reason"]
+            business     = s.get("business", "")
+            topic        = s.get("topic", "")
+            context      = s.get("context", "")
+
             report += (
-                f"📌 **{s['ticker']}** （{int(s['price'])}円）\n"
-                f"🔔 シグナル: {s['signal_type']}\n"
-                f"📐 根拠: {s['reason']}\n"
-                f"🔍 企業調査: {s['insight']}\n"
-                f"────────────────────\n"
+                f"📌 **{company_name}**（{ticker} / {int(price)}円）\n"
+                f"🏢 事業概要: {business}\n"
+                f"🔔 シグナル: {signal_type}\n"
+                f"📐 根拠: {reason}\n"
             )
+            if topic and topic != "特になし":
+                report += f"📰 直近トピック: {topic}\n"
+            if context:
+                report += f"🔍 状況: {context}\n"
+            report += "────────────────────\n"
+
         send_discord(report)
         print(f"✅ {len(signals)} 件のシグナルを Discord に送信しました")
     else:
