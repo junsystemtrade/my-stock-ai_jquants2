@@ -14,7 +14,10 @@ signal_engine.py
 """
 
 import os
+import time
 import yaml
+import json
+import re
 import pandas as pd
 from pathlib import Path
 from google import genai
@@ -36,11 +39,36 @@ def _load_config() -> dict:
             "volume_surge":  {"enabled": True, "window": 20, "multiplier": 2.0},
         },
         "filter": {
-            "min_price":      200,
-            "max_price":    50000,
-            "min_data_days":   80,
+            "min_price":            500,
+            "max_price":          50000,
+            "min_data_days":         80,
+            "exclude_code_range": [[1000, 1999]],
+            "max_signals_per_ticker": 1,
         },
     }
+
+
+# -----------------------------------------------------------------------
+# ETF・REIT 除外チェック
+# -----------------------------------------------------------------------
+def _is_excluded(ticker: str, cfg: dict) -> bool:
+    """
+    ETF・REIT・インフラファンドなどを除外する。
+    signals_config.yml の exclude_code_range で設定した範囲を除外。
+    例: [1000, 1999] → 1000.T〜1999.T を除外
+    """
+    filter_cfg = cfg.get("filter", {})
+    exclude_ranges = filter_cfg.get("exclude_code_range", [])
+
+    try:
+        code = int(ticker.replace(".T", "").strip())
+    except ValueError:
+        return False
+
+    for r in exclude_ranges:
+        if len(r) == 2 and r[0] <= code <= r[1]:
+            return True
+    return False
 
 
 # -----------------------------------------------------------------------
@@ -62,9 +90,17 @@ def _calc_rsi(series: pd.Series, window: int = 14) -> pd.Series:
 # シグナル判定（1 銘柄ぶん）
 # -----------------------------------------------------------------------
 def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """
+    1 銘柄の DataFrame に対してシグナル判定を行う。
+    max_signals_per_ticker の設定により、最も強いシグナル1件のみ返す。
+    """
     signals_cfg = cfg.get("signals", {})
     filter_cfg  = cfg.get("filter", {})
     results     = []
+
+    # ETF・REIT 除外
+    if _is_excluded(ticker, cfg):
+        return []
 
     min_days = filter_cfg.get("min_data_days", 80)
     if len(df) < min_days:
@@ -74,7 +110,8 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     volume = df["volume"].astype(float)
     latest = close.iloc[-1]
 
-    min_p = filter_cfg.get("min_price", 200)
+    # 価格フィルター
+    min_p = filter_cfg.get("min_price", 500)
     max_p = filter_cfg.get("max_price", 50000)
     if not (min_p <= latest <= max_p):
         return []
@@ -95,6 +132,7 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
             results.append({
                 "signal_type": "ゴールデンクロス",
                 "reason": f"短期MA({short_w}日){sma_s.iloc[-1]:.0f}円が長期MA({long_w}日){sma_l.iloc[-1]:.0f}円を上抜け",
+                "priority": 1,
             })
 
     # ---- ② RSI 売られすぎ ----
@@ -107,6 +145,7 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
             results.append({
                 "signal_type": "RSI売られすぎ",
                 "reason": f"RSI({rsi_w}日): {rsi.iloc[-1]:.1f}（閾値 {threshold} を下回る）",
+                "priority": 2,
             })
 
     # ---- ③ 出来高急増 ----
@@ -119,11 +158,20 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
             results.append({
                 "signal_type": "出来高急増",
                 "reason": f"当日出来高 {volume.iloc[-1]:,.0f} が{vol_w}日平均の {mult}倍超（平均: {avg_v:,.0f}）",
+                "priority": 3,
             })
+
+    if not results:
+        return []
+
+    # 1銘柄あたりの最大シグナル数（デフォルト1件）
+    max_signals = filter_cfg.get("max_signals_per_ticker", 1)
+    results     = sorted(results, key=lambda x: x["priority"])[:max_signals]
 
     for r in results:
         r["ticker"] = ticker
         r["price"]  = latest
+        r.pop("priority", None)
 
     return results
 
@@ -140,7 +188,7 @@ def _get_company_name(ticker: str, ticker_map: dict) -> str:
 
 
 # -----------------------------------------------------------------------
-# Gemini による企業調査
+# Gemini による企業調査（リトライ付き）
 # -----------------------------------------------------------------------
 def _research_company(
     client: genai.Client,
@@ -148,20 +196,11 @@ def _research_company(
     company_name: str,
     signal_type: str,
     reason: str,
+    max_retries: int = 3,
 ) -> dict:
     """
     Gemini にその企業の調査をさせる。
-    売買シグナルや予想は出力させない。
-
-    Returns
-    -------
-    dict:
-        {
-            "business":  str,  # 事業概要（何をしている会社か）
-            "topic":     str,  # 直近トピック
-            "context":   str,  # シグナルとの関連性（ファクトのみ）
-        }
-    失敗時は各フィールドにエラーメッセージを入れて返す。
+    429（クォータ超過）の場合はリトライする。
     """
     code = ticker.replace(".T", "")
 
@@ -179,31 +218,42 @@ def _research_company(
   "context": "今回のシグナルと企業状況の関連性をファクトベースで1文（予想・推奨は禁止）"
 }}"""
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-        raw = response.text.strip()
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",   # 無料枠が大きいモデルを使用
+                contents=prompt,
+            )
+            raw = response.text.strip()
+            raw = re.sub(r"```json|```", "", raw).strip()
+            data = json.loads(raw)
 
-        # JSON パース
-        import json, re
-        # コードブロックが混入した場合も対応
-        raw = re.sub(r"```json|```", "", raw).strip()
-        data = json.loads(raw)
+            return {
+                "business": data.get("business", "（取得できませんでした）"),
+                "topic":    data.get("topic",    "（取得できませんでした）"),
+                "context":  data.get("context",  "（取得できませんでした）"),
+            }
 
-        return {
-            "business": data.get("business", "（取得できませんでした）"),
-            "topic":    data.get("topic",    "（取得できませんでした）"),
-            "context":  data.get("context",  "（取得できませんでした）"),
-        }
+        except Exception as e:
+            err_str = str(e)
+            # 429クォータ超過 → 待機してリトライ
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                wait_sec = 30 * (attempt + 1)  # 30秒、60秒、90秒と増やす
+                print(f"  ⚠️ Gemini 429 クォータ超過 → {wait_sec}秒待機してリトライ ({attempt+1}/{max_retries})")
+                time.sleep(wait_sec)
+                continue
+            # その他のエラー
+            return {
+                "business": "（企業調査エラー）",
+                "topic":    f"({e})",
+                "context":  "",
+            }
 
-    except Exception as e:
-        return {
-            "business": "（企業調査エラー）",
-            "topic":    f"({e})",
-            "context":  "",
-        }
+    return {
+        "business": "（Gemini クォータ超過。時間をおいて再実行してください）",
+        "topic":    "特になし",
+        "context":  "",
+    }
 
 
 # -----------------------------------------------------------------------
@@ -258,10 +308,10 @@ def scan_signals(daily_data: pd.DataFrame) -> list[dict]:
     if not all_signals:
         return []
 
-    # Gemini で企業調査
+    # Gemini で企業調査（シグナル間に1秒待機してクォータを節約）
     print("🤖 Gemini で企業調査中...")
     results = []
-    for sig in all_signals:
+    for i, sig in enumerate(all_signals):
         company_name = _get_company_name(sig["ticker"], ticker_map)
         research     = _research_company(
             client,
@@ -276,10 +326,14 @@ def scan_signals(daily_data: pd.DataFrame) -> list[dict]:
             "price":        sig["price"],
             "signal_type":  sig["signal_type"],
             "reason":       sig["reason"],
-            "business":     research["business"],   # ← 事業概要（何をしている会社か）
-            "topic":        research["topic"],       # ← 直近トピック
-            "context":      research["context"],     # ← シグナルとの関連性
+            "business":     research["business"],
+            "topic":        research["topic"],
+            "context":      research["context"],
         })
         print(f"  ✅ {sig['ticker']} {company_name} ({sig['signal_type']}) 調査完了")
+
+        # シグナル間に少し待機してクォータを節約
+        if i < len(all_signals) - 1:
+            time.sleep(2)
 
     return results
