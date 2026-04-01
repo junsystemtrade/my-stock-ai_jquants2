@@ -1,33 +1,26 @@
-# .github/workflows/manual_backtest.yml
-# =======================================
-# バックテストの手動実行 workflow
-# GitHub の Actions タブから手動でトリガーする
+# .github/workflows/daily_scan.yml
+# =================================
+# 毎営業日の銘柄スキャン + Discord 通知
+# 平日 06:30 JST（= UTC 21:30 前日）に自動実行
 
-name: Manual Backtest
+name: Daily Stock Scan
 
 on:
-  workflow_dispatch:
-    inputs:
-      notify_discord:
-        description: "Discord に結果を通知するか"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
+  schedule:
+    - cron: "30 21 * * 0-4"   # UTC 21:30 = JST 06:30（日〜木 → 月〜金実行）
+  workflow_dispatch:            # 手動実行も可能
 
 jobs:
-  backtest:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60    # バックテストは時間がかかるため長めに設定
+    timeout-minutes: 30
 
     env:
-      DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-      JQUANTS_API_KEY:     ${{ secrets.JQUANTS_API_KEY }}
-      GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      NOTIFY_DISCORD:      ${{ github.event.inputs.notify_discord }}
+      DATABASE_URL:          ${{ secrets.DATABASE_URL }}
+      JQUANTS_API_KEY:       ${{ secrets.JQUANTS_API_KEY }}
+      GOOGLE_API_KEY:        ${{ secrets.GOOGLE_API_KEY }}
+      DISCORD_WEBHOOK_URL:   ${{ secrets.DISCORD_WEBHOOK_URL }}
+      JQUANTS_MIN_INTERVAL_SEC: "13"   # Free プラン: 5 req/min
 
     steps:
       - name: ☁️ リポジトリをチェックアウト
@@ -42,5 +35,5 @@ jobs:
       - name: 📦 依存パッケージのインストール
         run: pip install -r requirements.txt
 
-      - name: 📊 バックテスト実行
-        run: python backtest_engine.py
+      - name: 🚀 銘柄スキャン実行
+        run: python main.py
