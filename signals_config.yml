@@ -1,7 +1,7 @@
 # signals_config.yml
 # ==================
-# シグナル条件の設定ファイル。
-# コードを変更せずにここだけ編集してチューニングできます。
+# ⚠️ これはテスト用の設定です。
+# テスト後は本番用の設定に戻してください。
 
 signals:
 
@@ -12,29 +12,29 @@ signals:
     long_window:  75
 
   # ---- ② RSI 売られすぎ ----
+  # テスト用: 閾値を 30 → 60 に緩めて多くの銘柄でシグナルが出るようにする
   rsi_oversold:
     enabled: true
     window:    14
-    threshold: 30
+    threshold: 60   # ← テスト用（本番は 30）
 
   # ---- ③ 出来高急増 ----
+  # テスト用: 倍率を 2.0 → 1.2 に緩める
   volume_surge:
     enabled: true
     window:     20
-    multiplier: 2.0
+    multiplier: 1.2  # ← テスト用（本番は 2.0）
 
 filter:
-  # 価格フィルター（低価格すぎる銘柄・高価格すぎる銘柄を除外）
-  min_price:      500    # 500円未満は除外（ETFや低位株が多い）
-  max_price:   50000     # 5万円超は除外
-  min_data_days:  80     # 計算に必要な最低データ日数
+  min_price:      500
+  max_price:   50000
+  min_data_days:  80
 
-  # ETF・REIT・インフラファンド除外
-  # 証券コード 1000〜1999 は ETF・ETN・REIT が集中しているため除外
+  # ETF・REIT除外（テスト中も有効）
   exclude_code_range:
-    - [1000, 1999]   # ETF・ETN・REIT・インフラファンド
+    - [1000, 1999]
 
-  # 1銘柄あたりの最大通知シグナル数（複数シグナルが重複するのを防ぐ）
+  # テスト用: 1銘柄1シグナル
   max_signals_per_ticker: 1
 
 backtest:
