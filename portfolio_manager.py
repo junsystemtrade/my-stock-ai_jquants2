@@ -325,7 +325,7 @@ def backfill_data():
     print(f"Backfill: {total} tickers / remaining: {len(remaining)}")
     print(f"Period: {start_str} to {end_str}")
 
-    chunk_size = 50
+    chunk_size = 100
     n_chunks = (len(remaining) + chunk_size - 1) // chunk_size
     saved_total = 0
 
