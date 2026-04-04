@@ -4,18 +4,20 @@ import time
 import requests
 import pandas as pd
 import yfinance as yf
+
 from datetime import date, timedelta, datetime
 from zoneinfo import ZoneInfo
+
 import database_manager
 
-BACKFILL_YEARS = 3
-_YF_SINGLE_SLEEP = float(os.getenv("YF_SINGLE_SLEEP", "0.3"))
-_YF_CHUNK_SIZE = int(os.getenv("YF_CHUNK_SIZE", "50"))
-_YF_SLEEP = float(os.getenv("YF_SLEEP_SEC", "3.0"))
-_DB_CHUNK_SIZE = int(os.getenv("DB_CHUNK_SIZE", "1000"))
-BASE_API = "https://api.jquants.com/v2"
+BACKFILL_YEARS    = 3
+_YF_SINGLE_SLEEP  = float(os.getenv("YF_SINGLE_SLEEP", "0.3"))
+_YF_CHUNK_SIZE    = int(os.getenv("YF_CHUNK_SIZE", "50"))
+_YF_SLEEP         = float(os.getenv("YF_SLEEP_SEC", "3.0"))
+_DB_CHUNK_SIZE    = int(os.getenv("DB_CHUNK_SIZE", "1000"))
+BASE_API          = "https://api.jquants.com/v2"
 EQ_DAILY_ENDPOINT = "/equities/bars/daily"
-_SAMPLE_CODES = ["72030", "86580", "90840", "30480"]
+_SAMPLE_CODES     = ["72030", "86580", "90840", "30480"]
 _JQUANTS_INTERVAL = float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "12.5"))
 
 
@@ -41,32 +43,41 @@ def get_target_tickers():
         return {_to_yf_ticker(k): v for k, v in raw.items()}
     except ImportError:
         pass
+
     from bs4 import BeautifulSoup
-    base_url = "https://www.jpx.co.jp"
+
+    base_url  = "https://www.jpx.co.jp"
     list_page = f"{base_url}/markets/statistics-equities/misc/01.html"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers   = {"User-Agent": "Mozilla/5.0"}
+
     try:
-        res = requests.get(list_page, headers=headers, timeout=30)
+        res  = requests.get(list_page, headers=headers, timeout=30)
         soup = BeautifulSoup(res.text, "html.parser")
         link = soup.find("a", href=lambda x: x and "data_j.xls" in x)
         if not link:
             print("WARNING: JPX master link not found")
             return {}
+
         excel_url = base_url + link["href"]
-        resp = requests.get(excel_url, headers=headers, timeout=60)
+        resp      = requests.get(excel_url, headers=headers, timeout=60)
+
         if excel_url.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
         else:
             df = pd.read_excel(io.BytesIO(resp.content), engine="xlrd")
+
         df.columns = [str(c).strip() for c in df.columns]
+
         stock_map = {}
         for _, row in df.iterrows():
             code = str(row.iloc[1]).strip()
             name = str(row.iloc[2]).strip()
             if len(code) >= 4 and code[:4].isdigit():
                 stock_map[f"{code[:4]}.T"] = {"name": name}
+
         print(f"OK JPX master: {len(stock_map)} tickers")
         return stock_map
+
     except Exception as e:
         print(f"ERROR JPX master: {e}")
         return {}
@@ -76,15 +87,18 @@ def _jq_latest_date():
     api_key = os.getenv("JQUANTS_API_KEY", "").strip()
     if not api_key:
         return None
-    url = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
-    best = None
+
+    url      = f"{BASE_API}{EQ_DAILY_ENDPOINT}"
+    best     = None
     last_req = 0.0
+
     for code in _SAMPLE_CODES:
         try:
             elapsed = time.monotonic() - last_req
             if elapsed < _JQUANTS_INTERVAL:
                 time.sleep(_JQUANTS_INTERVAL - elapsed)
             last_req = time.monotonic()
+
             r = requests.get(
                 url,
                 headers={"x-api-key": api_key, "Accept": "application/json"},
@@ -102,6 +116,7 @@ def _jq_latest_date():
                 best = d
         except Exception:
             continue
+
     return best
 
 
@@ -118,10 +133,13 @@ def _yf_fetch_single(ticker, start, end):
         )
     except Exception:
         return pd.DataFrame()
+
     if raw is None or raw.empty:
         return pd.DataFrame()
+
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
+
     records = []
     for idx, row in raw.iterrows():
         close = row.get("Close")
@@ -129,27 +147,32 @@ def _yf_fetch_single(ticker, start, end):
             continue
         records.append({
             "ticker": _to_db_ticker(ticker),
-            "date": idx.date(),
-            "open": float(row["Open"]) if pd.notna(row.get("Open")) else None,
-            "high": float(row["High"]) if pd.notna(row.get("High")) else None,
-            "low": float(row["Low"]) if pd.notna(row.get("Low")) else None,
-            "price": float(close),
-            "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+            "date":   idx.date(),
+            "open":   float(row["Open"])   if pd.notna(row.get("Open"))   else None,
+            "high":   float(row["High"])   if pd.notna(row.get("High"))   else None,
+            "low":    float(row["Low"])    if pd.notna(row.get("Low"))    else None,
+            "price":  float(close),
+            "volume": int(row["Volume"])   if pd.notna(row.get("Volume")) else None,
         })
+
     if not records:
         return pd.DataFrame()
+
     return pd.DataFrame(records)
 
 
 def _yf_fetch_chunk(tickers, start, end):
     if not tickers:
         return pd.DataFrame()
+
     all_records = []
-    n_chunks = (len(tickers) + _YF_CHUNK_SIZE - 1) // _YF_CHUNK_SIZE
+    n_chunks    = (len(tickers) + _YF_CHUNK_SIZE - 1) // _YF_CHUNK_SIZE
+
     for i in range(0, len(tickers), _YF_CHUNK_SIZE):
-        chunk = tickers[i: i + _YF_CHUNK_SIZE]
+        chunk    = tickers[i : i + _YF_CHUNK_SIZE]
         chunk_no = i // _YF_CHUNK_SIZE + 1
         print(f"  chunk {chunk_no}/{n_chunks} ({len(chunk)} tickers)", end=" ... ", flush=True)
+
         try:
             raw = yf.download(
                 chunk,
@@ -166,10 +189,12 @@ def _yf_fetch_chunk(tickers, start, end):
             print(f"ERROR: {e}")
             time.sleep(_YF_SLEEP * 2)
             continue
+
         if raw is None or raw.empty:
             print("empty")
             time.sleep(_YF_SLEEP)
             continue
+
         count = 0
         for ticker in chunk:
             try:
@@ -177,26 +202,30 @@ def _yf_fetch_chunk(tickers, start, end):
                     df = raw[ticker].dropna(how="all")
                 else:
                     df = raw.dropna(how="all")
+
                 for idx, row in df.iterrows():
                     close = row.get("Close")
                     if pd.isna(close):
                         continue
                     all_records.append({
                         "ticker": _to_db_ticker(ticker),
-                        "date": idx.date(),
-                        "open": float(row["Open"]) if pd.notna(row.get("Open")) else None,
-                        "high": float(row["High"]) if pd.notna(row.get("High")) else None,
-                        "low": float(row["Low"]) if pd.notna(row.get("Low")) else None,
-                        "price": float(close),
-                        "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+                        "date":   idx.date(),
+                        "open":   float(row["Open"])   if pd.notna(row.get("Open"))   else None,
+                        "high":   float(row["High"])   if pd.notna(row.get("High"))   else None,
+                        "low":    float(row["Low"])    if pd.notna(row.get("Low"))    else None,
+                        "price":  float(close),
+                        "volume": int(row["Volume"])   if pd.notna(row.get("Volume")) else None,
                     })
                     count += 1
             except (KeyError, TypeError):
                 continue
+
         print(f"OK {count} rows")
         time.sleep(_YF_SLEEP)
+
     if not all_records:
         return pd.DataFrame()
+
     return (
         pd.DataFrame(all_records)
         .drop_duplicates(subset=["ticker", "date"])
@@ -214,9 +243,11 @@ def _prev_business_day(d):
 def _get_existing_tickers(db, since):
     from sqlalchemy import text
     query = text("""
-        SELECT ticker FROM daily_prices
+        SELECT ticker
+        FROM daily_prices
         WHERE date >= :since
-        GROUP BY ticker HAVING COUNT(*) >= 50
+        GROUP BY ticker
+        HAVING COUNT(*) >= 50
     """)
     try:
         with db.engine.connect() as conn:
@@ -238,92 +269,119 @@ def _count_rows(db):
 
 def sync_data():
     db = database_manager.DBManager()
+
     print("Checking JQuants latest date...")
     jq_latest = _jq_latest_date()
     if jq_latest:
         print(f"JQuants latest: {jq_latest}")
-    target_end = _prev_business_day(_today_jst())
+
+    target_end    = _prev_business_day(_today_jst())
     db_latest_str = db.get_latest_saved_date()
+
     if db_latest_str is None:
         print("WARNING: No data in DB. Run Initial Backfill first.")
         return
-    db_latest = date.fromisoformat(db_latest_str)
+
+    db_latest  = date.fromisoformat(db_latest_str)
     start_date = db_latest + timedelta(days=1)
+
     if start_date > target_end:
         print(f"OK DB is up to date (latest: {db_latest}). Skip.")
         return
+
     print(f"Sync: {start_date} to {target_end}")
-    ticker_map = get_target_tickers()
+
+    ticker_map     = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+    start_str      = start_date.strftime("%Y-%m-%d")
+    end_str        = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+
     print(f"Yahoo Finance bulk fetch: {len(all_yf_tickers)} tickers")
     df = _yf_fetch_chunk(all_yf_tickers, start_str, end_str)
+
     if df.empty:
         print("WARNING: No data fetched.")
         return
+
     db.save_prices(df)
     print(f"DONE sync: {len(df)} rows saved")
 
 
 def backfill_data():
     db = database_manager.DBManager()
-    today = _today_jst()
+
+    today        = _today_jst()
     target_start = today - timedelta(days=BACKFILL_YEARS * 365)
-    target_end = _prev_business_day(today)
-    start_str = target_start.strftime("%Y-%m-%d")
-    end_str = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+    target_end   = _prev_business_day(today)
+    start_str    = target_start.strftime("%Y-%m-%d")
+    end_str      = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+
     db_oldest_str = db.get_oldest_saved_date()
     db_latest_str = db.get_latest_saved_date()
+
     print(f"DB status:")
     print(f"  oldest: {db_oldest_str or 'none'}")
     print(f"  latest: {db_latest_str or 'none'}")
     print(f"  target: {target_start} to {target_end}")
-    ticker_map = get_target_tickers()
+
+    ticker_map     = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
-    total = len(all_yf_tickers)
+    total          = len(all_yf_tickers)
+
     existing_tickers = _get_existing_tickers(db, target_start)
-    remaining = total - len(existing_tickers)
+    remaining        = total - len(existing_tickers)
+
     print(f"Backfill: {total} tickers total")
     print(f"  already done: {len(existing_tickers)}")
     print(f"  remaining:    {remaining}")
     print(f"  est. time:    {remaining * _YF_SINGLE_SLEEP / 60:.0f} min")
-    saved_total = 0
-    skip_count = 0
-    error_count = 0
+
+    saved_total  = 0
+    skip_count   = 0
+    error_count  = 0
     batch_buffer = []
-    batch_size = 100
+    batch_size   = 100
+
     for idx, ticker in enumerate(all_yf_tickers, 1):
         if ticker in existing_tickers:
             skip_count += 1
             continue
+
         if idx % 200 == 0 or idx == 1:
             print(f"  [{idx}/{total}] saved={saved_total} skip={skip_count} err={error_count}", flush=True)
+
         df = _yf_fetch_single(ticker, start_str, end_str)
+
         if df.empty:
             error_count += 1
         else:
             batch_buffer.append(df)
+
         if len(batch_buffer) >= batch_size:
-            combined = pd.concat(batch_buffer, ignore_index=True)
+            combined     = pd.concat(batch_buffer, ignore_index=True)
             db.save_prices(combined)
-            saved_total += len(combined)
-            batch_buffer = []
+            saved_total  += len(combined)
+            batch_buffer  = []
+
         time.sleep(_YF_SINGLE_SLEEP)
+
     if batch_buffer:
-        combined = pd.concat(batch_buffer, ignore_index=True)
+        combined     = pd.concat(batch_buffer, ignore_index=True)
         db.save_prices(combined)
         saved_total += len(combined)
-    new_oldest = db.get_oldest_saved_date()
-    new_latest = db.get_latest_saved_date()
-    total_rows = _count_rows(db)
+
+    new_oldest  = db.get_oldest_saved_date()
+    new_latest  = db.get_latest_saved_date()
+    total_rows  = _count_rows(db)
+
     print(f"Backfill complete:")
     print(f"  saved:   {saved_total} rows")
     print(f"  skipped: {skip_count} tickers")
-    print(f"  errors:  {error_count} tickers")
+    print(f"  errors:  {error_count} tickers (delisted etc)")
     print(f"  DB total:{total_rows} rows")
     print(f"  oldest:  {new_oldest}")
     print(f"  latest:  {new_latest}")
+
     if new_oldest and date.fromisoformat(new_oldest) <= target_start + timedelta(days=10):
         print(f"SUCCESS: {BACKFILL_YEARS} years of data collected!")
     else:
