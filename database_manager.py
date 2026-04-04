@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 _DB_CHUNK_SIZE = int(os.getenv("DB_CHUNK_SIZE", "1000"))
 
 
+
 class DBManager:
     def __init__(self):
         db_url = os.getenv("DATABASE_URL")
@@ -22,7 +23,7 @@ class DBManager:
             pool_recycle=1800,
             connect_args={
                 "connect_timeout": 30,
-                "options": "-c statement_timeout=60000"
+                "options": "-c statement_timeout=300000"
             },
         )
         self._ensure_table()
