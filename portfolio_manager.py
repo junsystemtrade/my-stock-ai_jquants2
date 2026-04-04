@@ -183,7 +183,7 @@ def _yf_fetch_chunk(tickers, start, end):
                 progress=False,
                 group_by="ticker",
                 threads=True,
-                timeout=60,
+                timeout=120,
             )
         except Exception as e:
             print(f"ERROR: {e}")
@@ -344,7 +344,7 @@ def backfill_data():
                 progress=False,
                 group_by="ticker",
                 threads=True,
-                timeout=60,
+                timeout=120,
             )
         except Exception as e:
             print(f"ERROR: {e}")
