@@ -9,7 +9,7 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 340
 
     env:
       DATABASE_URL:             ${{ secrets.DATABASE_URL }}
