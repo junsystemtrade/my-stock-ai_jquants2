@@ -309,84 +309,92 @@ def sync_data():
 
 def backfill_data():
     db = database_manager.DBManager()
-
-    today        = _today_jst()
+    today = _today_jst()
     target_start = today - timedelta(days=BACKFILL_YEARS * 365)
-    target_end   = _prev_business_day(today)
-    start_str    = target_start.strftime("%Y-%m-%d")
-    end_str      = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+    target_end = _prev_business_day(today)
+    start_str = target_start.strftime("%Y-%m-%d")
+    end_str = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    db_oldest_str = db.get_oldest_saved_date()
-    db_latest_str = db.get_latest_saved_date()
-
-    print(f"DB status:")
-    print(f"  oldest: {db_oldest_str or 'none'}")
-    print(f"  latest: {db_latest_str or 'none'}")
-    print(f"  target: {target_start} to {target_end}")
-
-    ticker_map     = get_target_tickers()
+    ticker_map = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
-    total          = len(all_yf_tickers)
+    total = len(all_yf_tickers)
 
     existing_tickers = _get_existing_tickers(db, target_start)
-    remaining        = total - len(existing_tickers)
+    remaining = [t for t in all_yf_tickers if t not in existing_tickers]
 
-    print(f"Backfill: {total} tickers total")
-    print(f"  already done: {len(existing_tickers)}")
-    print(f"  remaining:    {remaining}")
-    print(f"  est. time:    {remaining * _YF_SINGLE_SLEEP / 60:.0f} min")
+    print(f"Backfill: {total} tickers / remaining: {len(remaining)}")
+    print(f"Period: {start_str} to {end_str}")
 
-    saved_total  = 0
-    skip_count   = 0
-    error_count  = 0
-    batch_buffer = []
-    batch_size   = 100
+    chunk_size = 50
+    n_chunks = (len(remaining) + chunk_size - 1) // chunk_size
+    saved_total = 0
 
-    for idx, ticker in enumerate(all_yf_tickers, 1):
-        if ticker in existing_tickers:
-            skip_count += 1
+    for i in range(0, len(remaining), chunk_size):
+        chunk = remaining[i: i + chunk_size]
+        chunk_no = i // chunk_size + 1
+        print(f"[{chunk_no}/{n_chunks}] {len(chunk)} tickers", end=" ... ", flush=True)
+
+        try:
+            raw = yf.download(
+                chunk,
+                start=start_str,
+                end=end_str,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+                timeout=60,
+            )
+        except Exception as e:
+            print(f"ERROR: {e}")
+            time.sleep(5)
             continue
 
-        if idx % 200 == 0 or idx == 1:
-            print(f"  [{idx}/{total}] saved={saved_total} skip={skip_count} err={error_count}", flush=True)
+        if raw is None or raw.empty:
+            print("empty")
+            time.sleep(3)
+            continue
 
-        df = _yf_fetch_single(ticker, start_str, end_str)
+        records = []
+        for ticker in chunk:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    df = raw[ticker].dropna(how="all")
+                else:
+                    df = raw.dropna(how="all")
+                for idx, row in df.iterrows():
+                    close = row.get("Close")
+                    if pd.isna(close):
+                        continue
+                    records.append({
+                        "ticker": _to_db_ticker(ticker),
+                        "date": idx.date(),
+                        "open": float(row["Open"]) if pd.notna(row.get("Open")) else None,
+                        "high": float(row["High"]) if pd.notna(row.get("High")) else None,
+                        "low": float(row["Low"]) if pd.notna(row.get("Low")) else None,
+                        "price": float(close),
+                        "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+                    })
+            except (KeyError, TypeError):
+                continue
 
-        if df.empty:
-            error_count += 1
+        if records:
+            df_out = pd.DataFrame(records).drop_duplicates(subset=["ticker", "date"])
+            db.save_prices(df_out)
+            saved_total += len(df_out)
+            print(f"OK {len(df_out)} rows (total: {saved_total})")
         else:
-            batch_buffer.append(df)
+            print("no data")
 
-        if len(batch_buffer) >= batch_size:
-            combined     = pd.concat(batch_buffer, ignore_index=True)
-            db.save_prices(combined)
-            saved_total  += len(combined)
-            batch_buffer  = []
+        time.sleep(3)
 
-        time.sleep(_YF_SINGLE_SLEEP)
-
-    if batch_buffer:
-        combined     = pd.concat(batch_buffer, ignore_index=True)
-        db.save_prices(combined)
-        saved_total += len(combined)
-
-    new_oldest  = db.get_oldest_saved_date()
-    new_latest  = db.get_latest_saved_date()
-    total_rows  = _count_rows(db)
-
-    print(f"Backfill complete:")
-    print(f"  saved:   {saved_total} rows")
-    print(f"  skipped: {skip_count} tickers")
-    print(f"  errors:  {error_count} tickers (delisted etc)")
-    print(f"  DB total:{total_rows} rows")
-    print(f"  oldest:  {new_oldest}")
-    print(f"  latest:  {new_latest}")
-
-    if new_oldest and date.fromisoformat(new_oldest) <= target_start + timedelta(days=10):
-        print(f"SUCCESS: {BACKFILL_YEARS} years of data collected!")
+    total_rows = _count_rows(db)
+    print(f"Backfill complete: {saved_total} rows saved / DB total: {total_rows}")
+    if total_rows > 2000000:
+        print("SUCCESS: enough data collected!")
     else:
-        print("INCOMPLETE: Run Initial Backfill again to continue.")
-
+        print("INCOMPLETE: run again to continue.")
 
 if __name__ == "__main__":
     backfill_data()
