@@ -1,64 +1,53 @@
-# .github/workflows/backfill.yml
-# ================================
-# 初回バックフィル専用 workflow（3年分）
-#
-# 【重要】J-Quants Free プランの制約により複数回実行が必要
-#   3年 ≒ 750 営業日 × 約 30 秒/日 = 約 6〜8 時間
-#   GitHub Actions の無料枠は 1 ジョブ最大 6 時間のため、
-#   1 回で終わらない場合は再度手動実行してください。
-#   DB の最終保存日から自動的に「続き」を再開します。
-#
-# 【実行手順】
-#   1. Actions タブ → "Initial Backfill" → "Run workflow"
-#   2. 6 時間で止まった場合は再度 "Run workflow" を実行
-#   3. "DB はすでに最新です" と表示されたら完了
-
 name: Initial Backfill (3 Years)
 
 on:
-  workflow_dispatch:   # 手動実行のみ
+  workflow_dispatch:
+  # 完了するまで毎30分自動実行
+  schedule:
+    - cron: "0,30 * * * *"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # 5時間50分（GitHub Actions 上限 6時間の手前で安全停止）
+    timeout-minutes: 25
 
     env:
       DATABASE_URL:             ${{ secrets.DATABASE_URL }}
       JQUANTS_API_KEY:          ${{ secrets.JQUANTS_API_KEY }}
       GOOGLE_API_KEY:           ${{ secrets.GOOGLE_API_KEY }}
       DISCORD_WEBHOOK_URL:      ${{ secrets.DISCORD_WEBHOOK_URL }}
-      JQUANTS_MIN_INTERVAL_SEC: "12.5"   # Free: 5req/min → 12.0秒が最短、0.5秒余裕
-      BATCH_DAYS:               "5"       # 5日分まとめてDBに保存（オーバーヘッド削減）
-      YF_CHUNK_SIZE:            "100"     # Yahoo Finance 1リクエストあたり最大銘柄数
-      YF_SLEEP_SEC:             "2.0"     # Yahoo Finance チャンク間の待機秒数
+      JQUANTS_MIN_INTERVAL_SEC: "12.5"
+      YF_SINGLE_SLEEP:          "0.3"
+      YF_CHUNK_SIZE:            "50"
+      YF_SLEEP_SEC:             "3.0"
+      DB_CHUNK_SIZE:            "1000"
 
     steps:
-      - name: ☁️ リポジトリをチェックアウト
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🐍 Python セットアップ
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: 📦 依存パッケージのインストール
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: 🗄️ バックフィル実行（続きから自動再開）
+      - name: Run backfill
         run: python portfolio_manager.py
 
-      - name: 📢 完了通知（Discord）
+      - name: Notify Discord
         if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           STATUS="${{ job.status }}"
           if [ "$STATUS" = "success" ]; then
-            MSG="✅ バックフィル実行完了（または最新状態）。次回実行で残りがあれば続きから再開します。"
+            MSG="OK Backfill run completed. Will continue automatically every 30 min until done."
           else
-            MSG="⚠️ バックフィルが途中で停止しました（タイムアウトの可能性）。再度 workflow を実行してください。"
+            MSG="INFO Backfill stopped (timeout or error). Auto-retrying in 30 min."
           fi
           curl -s -X POST "$DISCORD_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
