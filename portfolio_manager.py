@@ -16,7 +16,7 @@ _YF_CHUNK_SIZE    = int(os.getenv("YF_CHUNK_SIZE", "50"))
 _YF_SLEEP         = float(os.getenv("YF_SLEEP_SEC", "3.0"))
 _DB_CHUNK_SIZE    = int(os.getenv("DB_CHUNK_SIZE", "1000"))
 BASE_API          = "https://api.jquants.com/v2"
-EQ_DAILY_ENDPOINT = "/equities/bars/daily"
+WEQ_DAILY_ENDPOINT = "/equities/bars/daily"
 _SAMPLE_CODES     = ["72030", "86580", "90840", "30480"]
 _JQUANTS_INTERVAL = float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "12.5"))
 
@@ -247,7 +247,7 @@ def _get_existing_tickers(db, since):
         FROM daily_prices
         WHERE date >= :since
         GROUP BY ticker
-        HAVING COUNT(*) >= 50
+        HAVING COUNT(*) >= 700
     """)
     try:
         with db.engine.connect() as conn:
@@ -390,3 +390,4 @@ def backfill_data():
 
 if __name__ == "__main__":
     backfill_data()
+c
