@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import database_manager
 
 BACKFILL_YEARS    = 3
-_YF_SINGLE_SLEEP  = float(os.getenv("YF_SINGLE_SLEEP", "0.3"))
+_YF_SINGLE_SLEEP  = float(os.getenv("YF_SINGLE_SLEEP", "0.1"))
 _YF_CHUNK_SIZE    = int(os.getenv("YF_CHUNK_SIZE", "50"))
 _YF_SLEEP         = float(os.getenv("YF_SLEEP_SEC", "3.0"))
 _DB_CHUNK_SIZE    = int(os.getenv("DB_CHUNK_SIZE", "1000"))
