@@ -2,8 +2,8 @@ name: Initial Backfill (3 Years)
 
 on:
   workflow_dispatch:
-  # 完了するまで毎30分自動実行
-
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
   backfill:
