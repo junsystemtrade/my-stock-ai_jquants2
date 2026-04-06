@@ -121,17 +121,10 @@ def _jq_latest_date():
 
 
 def _yf_fetch_single(ticker, start, end):
+    """Fallback用: 1銘柄だけ取得する場合もベクトル演算で高速化"""
     try:
-        raw = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            timeout=30,
-        )
-    except Exception:
+        raw = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=True, progress=False, timeout=30)
+    except:
         return pd.DataFrame()
 
     if raw is None or raw.empty:
@@ -140,97 +133,67 @@ def _yf_fetch_single(ticker, start, end):
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
-    records = []
-    for idx, row in raw.iterrows():
-        close = row.get("Close")
-        if pd.isna(close) if isinstance(close, (float, int)) else pd.isna(close).any():
-            continue
-        records.append({
-            "ticker": _to_db_ticker(ticker),
-            "date":   idx.date(),
-            "open":   float(row["Open"])   if pd.notna(row.get("Open"))   else None,
-            "high":   float(row["High"])   if pd.notna(row.get("High"))   else None,
-            "low":    float(row["Low"])    if pd.notna(row.get("Low"))    else None,
-            "price":  float(close),
-            "volume": int(row["Volume"])   if pd.notna(row.get("Volume")) else None,
-        })
-
-    if not records:
-        return pd.DataFrame()
-
-    return pd.DataFrame(records)
+    # 1行ずつのループ(iterrows)を廃止し、ベクトル演算で処理
+    df = raw.copy()
+    df["ticker"] = _to_db_ticker(ticker)
+    df["date"]   = df.index.date
+    df["price"]  = df["Close"]
+    
+    # 必要列のリネームと抽出
+    df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
+    final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+    return df[final_cols].dropna(subset=["price"]).reset_index(drop=True)
 
 
 def _yf_fetch_chunk(tickers, start, end):
     if not tickers:
         return pd.DataFrame()
 
-    all_records = []
-    n_chunks    = (len(tickers) + _YF_CHUNK_SIZE - 1) // _YF_CHUNK_SIZE
-
-    for i in range(0, len(tickers), _YF_CHUNK_SIZE):
-        chunk    = tickers[i : i + _YF_CHUNK_SIZE]
-        chunk_no = i // _YF_CHUNK_SIZE + 1
-        print(f"  chunk {chunk_no}/{n_chunks} ({len(chunk)} tickers)", end=" ... ", flush=True)
-
-        try:
-            raw = yf.download(
-                chunk,
-                start=start,
-                end=end,
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                group_by="ticker",
-                threads=True,
-                timeout=120,
-            )
-        except Exception as e:
-            print(f"ERROR: {e}")
-            time.sleep(_YF_SLEEP * 2)
-            continue
-
-        if raw is None or raw.empty:
-            print("empty")
-            time.sleep(_YF_SLEEP)
-            continue
-
-        count = 0
-        for ticker in chunk:
-            try:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    df = raw[ticker].dropna(how="all")
-                else:
-                    df = raw.dropna(how="all")
-
-                for idx, row in df.iterrows():
-                    close = row.get("Close")
-                    if pd.isna(close) if isinstance(close, (float, int)) else pd.isna(close).any():
-                        continue
-                    all_records.append({
-                        "ticker": _to_db_ticker(ticker),
-                        "date":   idx.date(),
-                        "open":   float(row["Open"])   if pd.notna(row.get("Open"))   else None,
-                        "high":   float(row["High"])   if pd.notna(row.get("High"))   else None,
-                        "low":    float(row["Low"])    if pd.notna(row.get("Low"))    else None,
-                        "price":  float(close),
-                        "volume": int(row["Volume"])   if pd.notna(row.get("Volume")) else None,
-                    })
-                    count += 1
-            except (KeyError, TypeError):
-                continue
-
-        print(f"OK {count} rows")
-        time.sleep(_YF_SLEEP)
-
-    if not all_records:
+    try:
+        raw = yf.download(
+            tickers,
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+            timeout=120,
+        )
+    except Exception as e:
+        print(f" ERROR: {e}")
         return pd.DataFrame()
 
-    return (
-        pd.DataFrame(all_records)
-        .drop_duplicates(subset=["ticker", "date"])
-        .reset_index(drop=True)
-    )
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    all_dfs = []
+    # yfinanceは複数銘柄だとMultiIndexになる
+    if isinstance(raw.columns, pd.MultiIndex):
+        fetched_tickers = raw.columns.levels[0]
+    else:
+        # 1銘柄しか取れなかった場合
+        return _yf_fetch_single(tickers[0], start, end)
+
+    for t in fetched_tickers:
+        if t not in raw: continue
+        df_t = raw[t].dropna(how="all").copy()
+        if df_t.empty: continue
+        
+        # ベクトル演算で一括変換
+        df_t["ticker"] = _to_db_ticker(t)
+        df_t["date"]   = df_t.index.date
+        df_t["price"]  = df_t["Close"]
+        df_t = df_t.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
+        
+        final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+        all_dfs.append(df_t[final_cols].dropna(subset=["price"]))
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    return pd.concat(all_dfs, ignore_index=True)
 
 
 def _prev_business_day(d):
@@ -269,13 +232,7 @@ def _count_rows(db):
 
 def sync_data():
     db = database_manager.DBManager()
-
-    print("Checking JQuants latest date...")
-    jq_latest = _jq_latest_date()
-    if jq_latest:
-        print(f"JQuants latest: {jq_latest}")
-
-    target_end    = _prev_business_day(_today_jst())
+    target_end = _prev_business_day(_today_jst())
     db_latest_str = db.get_latest_saved_date()
 
     if db_latest_str is None:
@@ -289,27 +246,21 @@ def sync_data():
         print(f"OK DB is up to date (latest: {db_latest}). Skip.")
         return
 
-    print(f"Sync: {start_date} to {target_end}")
-
-    ticker_map     = get_target_tickers()
+    ticker_map = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
-    start_str      = start_date.strftime("%Y-%m-%d")
-    end_str        = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str   = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    print(f"Yahoo Finance bulk fetch: {len(all_yf_tickers)} tickers")
+    print(f"Sync: {start_str} to {target_end}")
     df = _yf_fetch_chunk(all_yf_tickers, start_str, end_str)
 
-    if df.empty:
-        print("WARNING: No data fetched.")
-        return
-
-    db.save_prices(df)
-    print(f"DONE sync: {len(df)} rows saved")
+    if not df.empty:
+        db.save_prices(df)
+        print(f"DONE sync: {len(df)} rows saved")
 
 
 def backfill_data():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
+    """一括取得(Bulk Mode)に最適化したバックフィル"""
     db = database_manager.DBManager()
     today = _today_jst()
     target_start = today - timedelta(days=BACKFILL_YEARS * 365)
@@ -319,49 +270,34 @@ def backfill_data():
 
     ticker_map = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
-    total = len(all_yf_tickers)
-
+    
     existing_tickers = _get_existing_tickers(db, target_start)
     remaining = [t for t in all_yf_tickers if t not in existing_tickers]
 
-    print(f"Backfill: {total} tickers / remaining: {len(remaining)}")
-    print(f"Period: {start_str} to {end_str}")
-
+    print(f"Backfill (FAST MODE): Total {len(all_yf_tickers)} / Remaining {len(remaining)}")
+    
+    chunk_size = 50 
     saved_total = 0
-    batch_buffer = []
-    batch_size = 50
-    workers = 10
 
-    def fetch_one(ticker):
-        return ticker, _yf_fetch_single(ticker, start_str, end_str)
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetch_one, t): t for t in remaining}
-        done = 0
-        for future in as_completed(futures):
-            ticker, df = future.result()
-            done += 1
-            if not df.empty:
-                batch_buffer.append(df)
-            if done % 10 == 0:
-                print(f"  [{done}/{len(remaining)}] saved={saved_total}", flush=True)
-            if len(batch_buffer) >= batch_size:
-                combined = pd.concat(batch_buffer, ignore_index=True)
-                db.save_prices(combined)
-                saved_total += len(combined)
-                batch_buffer = []
-
-    if batch_buffer:
-        combined = pd.concat(batch_buffer, ignore_index=True)
-        db.save_prices(combined)
-        saved_total += len(combined)
+    for i in range(0, len(remaining), chunk_size):
+        chunk = remaining[i : i + chunk_size]
+        current_count = i + len(chunk)
+        print(f" [{current_count}/{len(remaining)}] Downloading {len(chunk)} tickers...", end="", flush=True)
+        
+        df_chunk = _yf_fetch_chunk(chunk, start_str, end_str)
+        
+        if not df_chunk.empty:
+            db.save_prices(df_chunk)
+            saved_total += len(df_chunk)
+            print(f" OK (+{len(df_chunk)} rows)")
+        else:
+            print(" SKIP (no data)")
+        
+        # ブロック防止のための適度なスリープ
+        time.sleep(_YF_SLEEP)
 
     total_rows = _count_rows(db)
-    print(f"\nBackfill complete: {saved_total} rows / DB total: {total_rows}")
-    if total_rows > 2000000:
-        print("SUCCESS!")
-    else:
-        print("INCOMPLETE: run again.")
+    print(f"\nBackfill complete: Saved {saved_total} rows / DB Total: {total_rows}")
 
 if __name__ == "__main__":
     backfill_data()
