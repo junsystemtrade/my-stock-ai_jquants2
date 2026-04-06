@@ -308,10 +308,14 @@ def sync_data():
 
 
 def backfill_data():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     db = database_manager.DBManager()
     today = _today_jst()
     target_start = today - timedelta(days=BACKFILL_YEARS * 365)
     target_end = _prev_business_day(today)
+    start_str = target_start.strftime("%Y-%m-%d")
+    end_str = (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
 
     ticker_map = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
@@ -321,84 +325,36 @@ def backfill_data():
     remaining = [t for t in all_yf_tickers if t not in existing_tickers]
 
     print(f"Backfill: {total} tickers / remaining: {len(remaining)}")
+    print(f"Period: {start_str} to {end_str}")
 
-    periods = [
-        (target_start,                        target_start + timedelta(days=365)),
-        (target_start + timedelta(days=365),  target_start + timedelta(days=730)),
-        (target_start + timedelta(days=730),  target_end),
-    ]
-
-    chunk_size  = 500
     saved_total = 0
+    batch_buffer = []
+    batch_size = 50
+    workers = 10
 
-    for period_no, (p_start, p_end) in enumerate(periods, 1):
-        p_start_str = p_start.strftime("%Y-%m-%d")
-        p_end_str   = (p_end + timedelta(days=1)).strftime("%Y-%m-%d")
-        print(f"\nPeriod {period_no}/3: {p_start_str} to {p_end_str}")
-        n_chunks = (len(remaining) + chunk_size - 1) // chunk_size
+    def fetch_one(ticker):
+        return ticker, _yf_fetch_single(ticker, start_str, end_str)
 
-        for i in range(0, len(remaining), chunk_size):
-            chunk    = remaining[i: i + chunk_size]
-            chunk_no = i // chunk_size + 1
-            print(f"  [{chunk_no}/{n_chunks}] {len(chunk)} tickers", end=" ... ", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch_one, t): t for t in remaining}
+        done = 0
+        for future in as_completed(futures):
+            ticker, df = future.result()
+            done += 1
+            if not df.empty:
+                batch_buffer.append(df)
+            if done % 10 == 0:
+                print(f"  [{done}/{len(remaining)}] saved={saved_total}", flush=True)
+            if len(batch_buffer) >= batch_size:
+                combined = pd.concat(batch_buffer, ignore_index=True)
+                db.save_prices(combined)
+                saved_total += len(combined)
+                batch_buffer = []
 
-            try:
-                raw = yf.download(
-                    chunk,
-                    start=p_start_str,
-                    end=p_end_str,
-                    interval="1d",
-                    auto_adjust=True,
-                    progress=False,
-                    group_by="ticker",
-                    threads=True,
-                    timeout=120,
-                )
-            except Exception as e:
-                print(f"ERROR: {e}")
-                time.sleep(5)
-                continue
-
-            if raw is None or raw.empty:
-                print("empty")
-                time.sleep(3)
-                continue
-
-            records = []
-            for ticker in chunk:
-                try:
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        df = raw[ticker].dropna(how="all")
-                    else:
-                        df = raw.dropna(how="all")
-                    for idx, row in df.iterrows():
-                        close = row.get("Close")
-                        if pd.isna(close):
-                            continue
-                        records.append({
-                            "ticker": _to_db_ticker(ticker),
-                            "date":   idx.date(),
-                            "open":   float(row["Open"])   if pd.notna(row.get("Open"))   else None,
-                            "high":   float(row["High"])   if pd.notna(row.get("High"))   else None,
-                            "low":    float(row["Low"])    if pd.notna(row.get("Low"))    else None,
-                            "price":  float(close),
-                            "volume": int(row["Volume"])   if pd.notna(row.get("Volume")) else None,
-                        })
-                except (KeyError, TypeError):
-                    continue
-
-            if records:
-                df_out = (
-                    pd.DataFrame(records)
-                    .drop_duplicates(subset=["ticker", "date"])
-                )
-                db.save_prices(df_out)
-                saved_total += len(df_out)
-                print(f"OK {len(df_out)} rows (total: {saved_total})")
-            else:
-                print("no data")
-
-            time.sleep(2)
+    if batch_buffer:
+        combined = pd.concat(batch_buffer, ignore_index=True)
+        db.save_prices(combined)
+        saved_total += len(combined)
 
     total_rows = _count_rows(db)
     print(f"\nBackfill complete: {saved_total} rows / DB total: {total_rows}")
