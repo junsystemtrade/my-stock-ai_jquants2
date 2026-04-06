@@ -143,7 +143,7 @@ def _yf_fetch_single(ticker, start, end):
     records = []
     for idx, row in raw.iterrows():
         close = row.get("Close")
-        if pd.isna(close):
+        if pd.isna(close) if isinstance(close, (float, int)) else pd.isna(close).any():
             continue
         records.append({
             "ticker": _to_db_ticker(ticker),
@@ -205,7 +205,7 @@ def _yf_fetch_chunk(tickers, start, end):
 
                 for idx, row in df.iterrows():
                     close = row.get("Close")
-                    if pd.isna(close):
+                    if pd.isna(close) if isinstance(close, (float, int)) else pd.isna(close).any():
                         continue
                     all_records.append({
                         "ticker": _to_db_ticker(ticker),
