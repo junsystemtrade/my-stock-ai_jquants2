@@ -141,6 +141,11 @@ def _yf_fetch_single(ticker, start, end):
     
     df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
     final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+    
+    for c in final_cols:
+        if c not in df.columns:
+            df[c] = None
+
     return df[final_cols].dropna(subset=["price"]).reset_index(drop=True)
 
 
@@ -170,11 +175,11 @@ def _yf_fetch_chunk(tickers, start, end):
         return pd.DataFrame()
 
     all_dfs = []
-    # yfinance MultiIndex 構造の解析
+    final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+
     if isinstance(raw.columns, pd.MultiIndex):
         fetched_tickers = raw.columns.levels[0]
     else:
-        # 1銘柄のみの場合
         return _yf_fetch_single(tickers[0], start, end)
 
     print(f" [Debug] Formatting {len(fetched_tickers)} tickers...", end="", flush=True)
@@ -182,28 +187,38 @@ def _yf_fetch_chunk(tickers, start, end):
         try:
             if t not in raw: continue
             df_t = raw[t].copy()
-            # 必要なカラムが揃っていない、または空の場合はスキップ
+            
             if "Close" not in df_t.columns: continue
-            df_t = df_t.dropna(subset=["Close"])
-            if df_t.empty: continue
             
             df_t["ticker"] = _to_db_ticker(t)
             df_t["date"]   = df_t.index.date
             df_t["price"]  = df_t["Close"]
+            
             df_t = df_t.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
             
-            final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-            # 存在しないカラム（例: Volumeがない銘柄など）を安全にハンドリング
-            available_cols = [c for c in final_cols if c in df_t.columns]
-            all_dfs.append(df_t[available_cols])
-        except:
+            # 全てのDataFrameで列構造を完全に一致させる
+            for c in final_cols:
+                if c not in df_t.columns:
+                    df_t[c] = None
+            
+            df_t = df_t.dropna(subset=["price"])
+            if not df_t.empty:
+                all_dfs.append(df_t[final_cols])
+        except Exception:
             continue
     print(" Done")
 
     if not all_dfs:
         return pd.DataFrame()
 
-    return pd.concat(all_dfs, ignore_index=True)
+    try:
+        print(f" [Debug] Concat {len(all_dfs)} parts...", end="", flush=True)
+        res = pd.concat(all_dfs, ignore_index=True)
+        print(" Done")
+        return res
+    except Exception as e:
+        print(f" Concat Error: {e}")
+        return pd.DataFrame()
 
 
 def _prev_business_day(d):
@@ -285,7 +300,6 @@ def backfill_data():
 
     print(f"Backfill (FAST MODE): Remaining {len(remaining)}")
     
-    # 20件ずつに減らして進捗を分かりやすく
     chunk_size = 20 
     saved_total = 0
 
@@ -304,7 +318,7 @@ def backfill_data():
             except Exception as e:
                 print(f" DB Error: {e}")
         else:
-            print(" [Debug] No data found for this batch.")
+            print(" [Debug] No valid data found for this batch.")
         
         time.sleep(_YF_SLEEP)
 
