@@ -121,7 +121,6 @@ def _jq_latest_date():
 
 
 def _yf_fetch_single(ticker, start, end):
-    """Fallback用: 1銘柄だけ取得する場合もベクトル演算で高速化"""
     try:
         raw = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=True, progress=False, timeout=30)
     except:
@@ -133,13 +132,13 @@ def _yf_fetch_single(ticker, start, end):
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
-    # 1行ずつのループ(iterrows)を廃止し、ベクトル演算で処理
     df = raw.copy()
+    if "Close" not in df.columns: return pd.DataFrame()
+    
     df["ticker"] = _to_db_ticker(ticker)
     df["date"]   = df.index.date
     df["price"]  = df["Close"]
     
-    # 必要列のリネームと抽出
     df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
     final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
     return df[final_cols].dropna(subset=["price"]).reset_index(drop=True)
@@ -149,6 +148,7 @@ def _yf_fetch_chunk(tickers, start, end):
     if not tickers:
         return pd.DataFrame()
 
+    print(f" [Debug] Download Start (N={len(tickers)})...", end="", flush=True)
     try:
         raw = yf.download(
             tickers,
@@ -162,33 +162,43 @@ def _yf_fetch_chunk(tickers, start, end):
             timeout=120,
         )
     except Exception as e:
-        print(f" ERROR: {e}")
+        print(f" Error: {e}")
         return pd.DataFrame()
+    print(" Done")
 
     if raw is None or raw.empty:
         return pd.DataFrame()
 
     all_dfs = []
-    # yfinanceは複数銘柄だとMultiIndexになる
+    # yfinance MultiIndex 構造の解析
     if isinstance(raw.columns, pd.MultiIndex):
         fetched_tickers = raw.columns.levels[0]
     else:
-        # 1銘柄しか取れなかった場合
+        # 1銘柄のみの場合
         return _yf_fetch_single(tickers[0], start, end)
 
+    print(f" [Debug] Formatting {len(fetched_tickers)} tickers...", end="", flush=True)
     for t in fetched_tickers:
-        if t not in raw: continue
-        df_t = raw[t].dropna(how="all").copy()
-        if df_t.empty: continue
-        
-        # ベクトル演算で一括変換
-        df_t["ticker"] = _to_db_ticker(t)
-        df_t["date"]   = df_t.index.date
-        df_t["price"]  = df_t["Close"]
-        df_t = df_t.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
-        
-        final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
-        all_dfs.append(df_t[final_cols].dropna(subset=["price"]))
+        try:
+            if t not in raw: continue
+            df_t = raw[t].copy()
+            # 必要なカラムが揃っていない、または空の場合はスキップ
+            if "Close" not in df_t.columns: continue
+            df_t = df_t.dropna(subset=["Close"])
+            if df_t.empty: continue
+            
+            df_t["ticker"] = _to_db_ticker(t)
+            df_t["date"]   = df_t.index.date
+            df_t["price"]  = df_t["Close"]
+            df_t = df_t.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
+            
+            final_cols = ["ticker", "date", "open", "high", "low", "price", "volume"]
+            # 存在しないカラム（例: Volumeがない銘柄など）を安全にハンドリング
+            available_cols = [c for c in final_cols if c in df_t.columns]
+            all_dfs.append(df_t[available_cols])
+        except:
+            continue
+    print(" Done")
 
     if not all_dfs:
         return pd.DataFrame()
@@ -260,7 +270,6 @@ def sync_data():
 
 
 def backfill_data():
-    """一括取得(Bulk Mode)に最適化したバックフィル"""
     db = database_manager.DBManager()
     today = _today_jst()
     target_start = today - timedelta(days=BACKFILL_YEARS * 365)
@@ -274,30 +283,33 @@ def backfill_data():
     existing_tickers = _get_existing_tickers(db, target_start)
     remaining = [t for t in all_yf_tickers if t not in existing_tickers]
 
-    print(f"Backfill (FAST MODE): Total {len(all_yf_tickers)} / Remaining {len(remaining)}")
+    print(f"Backfill (FAST MODE): Remaining {len(remaining)}")
     
-    chunk_size = 50 
+    # 20件ずつに減らして進捗を分かりやすく
+    chunk_size = 20 
     saved_total = 0
 
     for i in range(0, len(remaining), chunk_size):
         chunk = remaining[i : i + chunk_size]
-        current_count = i + len(chunk)
-        print(f" [{current_count}/{len(remaining)}] Downloading {len(chunk)} tickers...", end="", flush=True)
+        print(f"\n--- Batch {i//chunk_size + 1} ---")
         
         df_chunk = _yf_fetch_chunk(chunk, start_str, end_str)
         
         if not df_chunk.empty:
-            db.save_prices(df_chunk)
-            saved_total += len(df_chunk)
-            print(f" OK (+{len(df_chunk)} rows)")
+            print(f" [Debug] DB Saving {len(df_chunk)} rows...", end="", flush=True)
+            try:
+                db.save_prices(df_chunk)
+                saved_total += len(df_chunk)
+                print(" OK!")
+            except Exception as e:
+                print(f" DB Error: {e}")
         else:
-            print(" SKIP (no data)")
+            print(" [Debug] No data found for this batch.")
         
-        # ブロック防止のための適度なスリープ
         time.sleep(_YF_SLEEP)
 
     total_rows = _count_rows(db)
-    print(f"\nBackfill complete: Saved {saved_total} rows / DB Total: {total_rows}")
+    print(f"\nBackfill complete: Saved {saved_total} / DB Total: {total_rows}")
 
 if __name__ == "__main__":
     backfill_data()
