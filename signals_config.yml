@@ -42,7 +42,6 @@ filter:
 # ==================================================
 scoring_logic:
   enabled: true
-  top_n: 3                # Discord通知＆Gemini調査対象とする数
 
   # 各指標の配点（合計100点）
   weights:
