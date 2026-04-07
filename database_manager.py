@@ -29,24 +29,44 @@ class DBManager:
         self._ensure_table()
 
     def _ensure_table(self):
-        ddl = """
-        CREATE TABLE IF NOT EXISTS daily_prices (
-            ticker  TEXT        NOT NULL,
-            date    DATE        NOT NULL,
-            open    NUMERIC,
-            high    NUMERIC,
-            low     NUMERIC,
-            price   NUMERIC,
-            volume  BIGINT,
-            PRIMARY KEY (ticker, date)
-        );
-        CREATE INDEX IF NOT EXISTS idx_daily_prices_date   ON daily_prices (date);
-        CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker ON daily_prices (ticker);
-        """
-        with self.engine.begin() as conn:
-            # タイムアウト設定を一時的に延長して、巨大なテーブルへのチェックを通す
-            conn.execute(text("SET statement_timeout = '60s'")) 
-            conn.execute(text(ddl))
+        """テーブルの存在確認を高速に行い、必要な時だけ DDL を実行する"""
+        check_query = text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'daily_prices'
+            );
+        """)
+        
+        try:
+            with self.engine.connect() as conn:
+                exists = conn.execute(check_query).scalar()
+            
+            if exists:
+                # テーブルが既に存在すれば、重い CREATE 文は一切発行せずに終了
+                return
+
+            # テーブルがない場合のみ、重い処理を実行
+            ddl = """
+            CREATE TABLE IF NOT EXISTS daily_prices (
+                ticker  TEXT        NOT NULL,
+                date    DATE        NOT NULL,
+                open    NUMERIC,
+                high    NUMERIC,
+                low     NUMERIC,
+                price   NUMERIC,
+                volume  BIGINT,
+                PRIMARY KEY (ticker, date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_prices_date   ON daily_prices (date);
+            CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker ON daily_prices (ticker);
+            """
+            with self.engine.begin() as conn:
+                conn.execute(text("SET statement_timeout = '120s'")) # 念のため120秒
+                conn.execute(text(ddl))
+                print("✅ データベーステーブルを新規作成しました")
+
+        except Exception as e:
+            print(f"⚠️ テーブル確認中にエラー（無視して続行）: {e}")
 
     def save_prices(self, df: pd.DataFrame):
         """重複はスキップしつつ chunksize 行ずつ分割 INSERT。"""
