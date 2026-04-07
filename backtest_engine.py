@@ -247,6 +247,33 @@ def run_backtest_and_report():
         _send_discord(msg)
         return
 
+    # --- 【ここから追加：銘柄別パフォーマンス分析】 ---
+    trades_df = pd.DataFrame(all_trades)
+    
+    # 銘柄ごとに損益を合計・平均・回数で集計
+    ticker_stats = trades_df.groupby('ticker')['pnl_pct'].agg(['sum', 'mean', 'count']).reset_index()
+    
+    # 利益貢献トップ10
+    top_10 = ticker_stats.sort_values(by='sum', ascending=False).head(10)
+    # 損失ワースト10
+    worst_10 = ticker_stats.sort_values(by='sum', ascending=True).head(10)
+
+    print("\n" + "="*30)
+    print("🔥 利益貢献トップ10銘柄 (合計損益順)")
+    print(top_10.to_string(index=False))
+    print("\n💀 損失ワースト10銘柄 (合計損益順)")
+    print(worst_10.to_string(index=False))
+    print("="*30 + "\n")
+    # --- 【ここまで追加】 ---
+
+    summary = _calc_summary(all_trades, bt_params)
+    
+    # (以下、既存のレポート生成と送信処理)
+    top_trades = sorted(all_trades, key=lambda x: x["pnl_pct"], reverse=True)
+    report = _format_report_with_gemini(summary, top_trades)
+    
+    _send_discord("📈 **【バックテストレポート】**\n" + report)
+
     summary    = _calc_summary(all_trades, bt_params)
     top_trades = sorted(all_trades, key=lambda x: x["pnl_pct"], reverse=True)
     report     = _format_report_with_gemini(summary, top_trades)
