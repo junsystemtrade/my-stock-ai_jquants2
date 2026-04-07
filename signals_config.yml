@@ -53,18 +53,16 @@ scoring_logic:
 
   # 各指標の配点（合計100点）
   weights:
-    volume_surge: 40      # 出来高の勢い（最大40点）
-    bias_proximity: 30    # 25日線との近さ＝初動感（最大30点）
-    rsi_position: 20      # RSIの立ち上がり（最大20点）
-    liquidity_scale: 10   # 売買代金の大きさ（最大10点）
+    volume_surge: 40      # 出来高の勢い
+    bias_proximity: 30    # 25日線との近さ
+    rsi_position: 20      # RSIの立ち上がり
+    liquidity_scale: 10   # 売買代金の大きさ
 
   # スコア算出のためのパラメータ
   parameters:
-    # 出来高倍率がこの値以上なら、出来高スコア満点
     volume_max_multiplier: 5.0
-    
-    # 25日線乖離率がこの値(%)以内なら加点、超えると減点
     bias_limit_pct: 10.0
-    
-    # 売買代金がこの値（10億円）以上なら流動性スコア満点
     turnover_ideal_min: 1000000000
+    
+    # --- 今回追加が必要な項目 ---
+    rsi_ideal_range: [40, 65]  # RSIが40〜65の間なら加点、といったロジック用
