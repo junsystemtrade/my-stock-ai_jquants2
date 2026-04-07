@@ -97,14 +97,24 @@ def main():
     # STEP 2.5: 地合いチェック
     print("\n--- STEP 2.5: 市場環境チェック ---")
     is_crashing, change_pct = check_market_health(cfg)
+    
+    # 判定スコアを常にコンソールに表示
+    market_status = "⚠️ 警戒 (暴落検知)" if is_crashing else "✅ 良好 (正常稼働)"
+    print(f"市場ステータス: {market_status}")
+    print(f"前日の市場騰落率: {change_pct:+.2f}%")
+
     if is_crashing:
         msg = (
             f"📉 **【市場警戒：スキャン停止】**\n"
-            f"前日の市場が大幅下落（{change_pct}%）したため、新規エントリー探索を中止しました。"
+            f"前日の市場が大幅下落（{change_pct:+.2f}%）したため、新規エントリー探索を中止しました。\n"
+            f"リスク回避を優先し、地合いの回復を待ちます。"
         )
         print(msg)
         send_discord(msg)
-        return
+        return  # 暴落時はここで終了
+    
+    # 良好な場合はログを残して STEP 3 へ継続
+    print("市場環境は規定値内です。シグナルスキャンを継続します。")
 
     # STEP 3: シグナルスキャン & 高速スコアリング
     print("\n--- STEP 3: シグナルスキャン & スコアリング ---")
