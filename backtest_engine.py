@@ -120,13 +120,12 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
         return {
             "total_trades": 0, "win_rate": 0.0, "avg_pnl_pct": 0.0,
             "total_pnl_yen": 0.0, "max_drawdown_pct": 0.0, "profit_factor": 0.0,
-            "score_analysis": {} # 追加
+            "score_analysis": {}
         }
 
     df = pd.DataFrame(trades)
     
-    # --- スコア帯別分析の追加 ---
-    # スコアを10点刻みのビン（0-10, 10-20...）に分ける
+    # --- 1. スコア帯別分析 ---
     df['score_bin'] = (df['score'] // 10) * 10
     score_stats = df.groupby('score_bin').agg(
         count=('pnl_pct', 'count'),
@@ -134,20 +133,34 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
         avg_return=('pnl_pct', 'mean')
     ).to_dict('index')
 
-    # ...（既存の集計コードはそのまま）...
-    
-    wins = df[df["pnl_pct"] > 0]
+    # --- 2. 全体指標の計算（ここが抜けていた箇所です） ---
+    wins   = df[df["pnl_pct"] > 0]
     losses = df[df["pnl_pct"] <= 0]
-    # ... (省略) ...
 
+    total_count = len(df)
+    win_rate    = len(wins) / total_count * 100
+    avg_pnl_pct = df["pnl_pct"].mean()
+    total_pnl   = df["pnl_yen"].sum()
+    
+    gross_profit = wins["pnl_yen"].sum() if not wins.empty else 0
+    gross_loss   = abs(losses["pnl_yen"].sum()) if not losses.empty else 1e-9
+    profit_factor = gross_profit / gross_loss
+
+    # ドローダウン計算
+    cumulative = df["pnl_yen"].cumsum()
+    peak       = cumulative.cummax()
+    drawdown   = cumulative - peak
+    max_dd_pct = (drawdown.min() / bt_params["initial_capital"] * 100) if bt_params["initial_capital"] != 0 else 0
+
+    # --- 3. 結果を辞書にまとめて返す ---
     return {
-        "total_trades": len(df),
-        "win_rate": round(win_rate, 1),
-        "avg_pnl_pct": round(avg_pnl_pct, 2),
-        "total_pnl_yen": round(total_pnl, 0),
+        "total_trades":     total_count,
+        "win_rate":         round(win_rate, 1),
+        "avg_pnl_pct":      round(avg_pnl_pct, 2),
+        "total_pnl_yen":    round(total_pnl, 0),
         "max_drawdown_pct": round(max_dd_pct, 2),
-        "profit_factor": round(profit_factor, 2),
-        "score_analysis": score_stats # これを返す
+        "profit_factor":    round(profit_factor, 2),
+        "score_analysis":   score_stats
     }
 
 
