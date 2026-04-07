@@ -23,7 +23,7 @@ class DBManager:
             pool_recycle=1800,
             connect_args={
                 "connect_timeout": 30,
-                "options": "-c statement_timeout=300000"
+                "options": "-c statement_timeout=0"
             },
         )
         self._ensure_table()
