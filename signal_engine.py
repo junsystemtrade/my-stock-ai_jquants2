@@ -221,7 +221,7 @@ def _research_company(
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model="gemini-1.5-flash",   # 無料枠が大きいモデルを使用
+                model="gemini-2.0-flash",   # 無料枠が大きいモデルを使用
                 contents=prompt,
             )
             raw = response.text.strip()
