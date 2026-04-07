@@ -44,6 +44,8 @@ class DBManager:
         CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker ON daily_prices (ticker);
         """
         with self.engine.begin() as conn:
+            # タイムアウト設定を一時的に延長して、巨大なテーブルへのチェックを通す
+            conn.execute(text("SET statement_timeout = '60s'")) 
             conn.execute(text(ddl))
 
     def save_prices(self, df: pd.DataFrame):
