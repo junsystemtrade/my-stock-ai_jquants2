@@ -1,0 +1,45 @@
+# signals_config.yml
+# ==================
+# 戦略: トレンドフォロー・初動ブレイク狙い
+# ターゲット: 流動性の高い中大型株
+
+signals:
+  # ---- ① トレンド発生のトリガー（ゴールデンクロスを初動として利用） ----
+  # 5日線(1週間)が25日線(1ヶ月)を抜くタイミングを「初動」と定義します
+  golden_cross:
+    enabled: true
+    short_window: 5
+    long_window: 25
+
+  # ---- ② RSIによる「過熱感」のチェック ----
+  # トレンド初動は「売られすぎ」から「反転」する時なので、
+  # RSIが低すぎるところからの立ち上がりを狙います（ここでは50以下を条件に想定）
+  rsi_oversold:
+    enabled: true
+    window: 14
+    threshold: 50  # 30だと厳しすぎるので、反転開始を捉えるために50に設定
+
+  # ---- ③ 出来高による「裏付け」 ----
+  # 誰も見ていない株が買われ始めた証拠として、出来高が2倍以上になったものを狙います
+  volume_surge:
+    enabled: true
+    window: 20
+    multiplier: 2.0
+
+filter:
+  # 価格帯: 500円〜50,000円（極端な低位株＝ボロ株を排除）
+  min_price: 500
+  max_price: 50000
+  
+  # 最低データ日数: 指標計算に必要な日数
+  min_data_days: 80
+
+  # 流動性フィルター: 売買代金が少ない「クズ株」を除外
+  # ※engine側に「min_daily_turnover_avg_20」等の項目を後日追加することを推奨しますが、
+  # 現状のコードでは「exclude_code_range」で銘柄群を絞るのが有効です。
+  exclude_code_range:
+    - [1000, 1999] # ETF/REIT除外
+    - [8951, 8987] # J-REIT除外
+
+  # 1銘柄につき1つのシグナルに絞る（優先順位はGC > RSI > 出来高）
+  max_signals_per_ticker: 1
