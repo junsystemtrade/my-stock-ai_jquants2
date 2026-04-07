@@ -14,14 +14,16 @@ from google import genai
 
 from database_manager import DBManager
 from signal_engine import _check_signals, _load_config
+# 指示通り、scoring_systemから関数をインポート
+from scoring_system import calculate_score
 
 
 # -----------------------------------------------------------------------
 # バックテストパラメータ
 # -----------------------------------------------------------------------
 _DEFAULT_BT_PARAMS = {
-    "hold_days":       10,
-    "stop_loss_pct":    5.0,
+    "hold_days":        10,
+    "stop_loss_pct":     5.0,
     "initial_capital":  1_000_000,
     "position_size":    0.1,
 }
@@ -44,6 +46,9 @@ def _backtest_ticker(ticker: str, df: pd.DataFrame, cfg: dict, bt_params: dict) 
     in_position = False
     min_days    = cfg.get("filter", {}).get("min_data_days", 80)
 
+    # 設定ファイルからスコアリングロジックを取得
+    scoring_cfg = cfg.get('scoring_logic', {})
+
     for i in range(min_days, len(df)):
         window_df = df.iloc[: i + 1].copy()
 
@@ -54,9 +59,15 @@ def _backtest_ticker(ticker: str, df: pd.DataFrame, cfg: dict, bt_params: dict) 
             if i + 1 >= len(df):
                 continue
 
+            # エントリー判定成立
             entry_row   = df.iloc[i + 1]
             entry_date  = entry_row["date"]
             entry_price = float(entry_row["open"]) if pd.notna(entry_row["open"]) else float(entry_row["price"])
+            
+            # 【指示通りの追記箇所】entry_price決定後、スコアを算出
+            # entry_row (df.iloc[i+1]) を渡して計算
+            current_score = calculate_score(entry_row, scoring_cfg)
+
             signal_type = hits[0]["signal_type"]
             in_position = True
 
@@ -80,11 +91,13 @@ def _backtest_ticker(ticker: str, df: pd.DataFrame, cfg: dict, bt_params: dict) 
                 exit_date   = df.iloc[exit_idx]["date"]
 
             trade_capital = capital * pos_size
-            pnl_pct       = (exit_price - entry_price) / entry_price * 100
-            pnl_yen       = trade_capital * (pnl_pct / 100)
+            pnl_pct        = (exit_price - entry_price) / entry_price * 100
+            pnl_yen        = trade_capital * (pnl_pct / 100)
 
+            # 【指示通りの追記箇所】tradesリストへ記録（scoreを追加）
             trades.append({
                 "ticker":      ticker,
+                "score":       current_score, # スコアを記録！
                 "signal_type": signal_type,
                 "entry_date":  str(entry_date),
                 "entry_price": round(entry_price, 2),
@@ -127,11 +140,11 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
 
     return {
         "total_trades":     len(df),
-        "win_rate":         round(win_rate, 1),
-        "avg_pnl_pct":      round(avg_pnl_pct, 2),
-        "total_pnl_yen":    round(total_pnl, 0),
+        "win_rate":          round(win_rate, 1),
+        "avg_pnl_pct":       round(avg_pnl_pct, 2),
+        "total_pnl_yen":     round(total_pnl, 0),
         "max_drawdown_pct": round(max_dd_pct, 2),
-        "profit_factor":    round(profit_factor, 2),
+        "profit_factor":     round(profit_factor, 2),
     }
 
 
@@ -247,7 +260,7 @@ def run_backtest_and_report():
         _send_discord(msg)
         return
 
-    # --- 【ここから追加：銘柄別パフォーマンス分析】 ---
+    # --- 銘柄別パフォーマンス分析 ---
     trades_df = pd.DataFrame(all_trades)
     
     # 銘柄ごとに損益を合計・平均・回数で集計
@@ -264,20 +277,13 @@ def run_backtest_and_report():
     print("\n💀 損失ワースト10銘柄 (合計損益順)")
     print(worst_10.to_string(index=False))
     print("="*30 + "\n")
-    # --- 【ここまで追加】 ---
 
     summary = _calc_summary(all_trades, bt_params)
     
-    # (以下、既存のレポート生成と送信処理)
+    # レポート生成と送信
     top_trades = sorted(all_trades, key=lambda x: x["pnl_pct"], reverse=True)
     report = _format_report_with_gemini(summary, top_trades)
     
-    _send_discord("📈 **【バックテストレポート】**\n" + report)
-
-    summary    = _calc_summary(all_trades, bt_params)
-    top_trades = sorted(all_trades, key=lambda x: x["pnl_pct"], reverse=True)
-    report     = _format_report_with_gemini(summary, top_trades)
-
     _send_discord("📈 **【バックテストレポート】**\n" + report)
     print("\n" + _format_report_plain(summary))
 
