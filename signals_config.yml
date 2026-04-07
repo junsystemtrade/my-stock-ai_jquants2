@@ -16,14 +16,14 @@ signals:
   rsi_oversold:
     enabled: true
     window:    14
-    threshold: 60   # ← テスト用（本番は 30）
+    threshold: 30   # ← テスト用（本番は 30）
 
   # ---- ③ 出来高急増 ----
   # テスト用: 倍率を 2.0 → 1.2 に緩める
   volume_surge:
     enabled: true
     window:     20
-    multiplier: 1.2  # ← テスト用（本番は 2.0）
+    multiplier: 2.0  # ← テスト用（本番は 2.0）
 
 filter:
   min_price:      500
