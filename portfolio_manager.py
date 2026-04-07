@@ -230,16 +230,15 @@ def _prev_business_day(d):
 
 def _get_existing_tickers(db, since):
     from sqlalchemy import text
+    # 修正ポイント：行数指定を外して、存在する銘柄をすべて取得
     query = text("""
         SELECT ticker
         FROM daily_prices
-        WHERE date >= :since
         GROUP BY ticker
-        HAVING COUNT(*) >= 700
     """)
     try:
         with db.engine.connect() as conn:
-            result = conn.execute(query, {"since": str(since)})
+            result = conn.execute(query)
             return {row[0] for row in result}
     except Exception:
         return set()
@@ -287,6 +286,7 @@ def sync_data():
 def backfill_data():
     db = database_manager.DBManager()
     today = _today_jst()
+    # 過去3年分をターゲットにする
     target_start = today - timedelta(days=BACKFILL_YEARS * 365)
     target_end = _prev_business_day(today)
     start_str = target_start.strftime("%Y-%m-%d")
@@ -295,35 +295,34 @@ def backfill_data():
     ticker_map = get_target_tickers()
     all_yf_tickers = list(ticker_map.keys())
     
+    # DBにある銘柄をチェック（1行でもあればスキップ対象）
     existing_tickers = _get_existing_tickers(db, target_start)
     remaining = [t for t in all_yf_tickers if t not in existing_tickers]
 
-    print(f"Backfill (FAST MODE): Remaining {len(remaining)}")
+    print(f"🚀 Backfill Start: Total={len(all_yf_tickers)}, Remaining={len(remaining)}")
     
-    chunk_size = 20 
+    # チャンクサイズを30〜50程度に上げても threads=True なら効率的です
+    chunk_size = 50 
     saved_total = 0
 
     for i in range(0, len(remaining), chunk_size):
         chunk = remaining[i : i + chunk_size]
-        print(f"\n--- Batch {i//chunk_size + 1} ---")
+        print(f"\n--- Batch {i//chunk_size + 1} / {len(remaining)//chunk_size + 1} ---")
         
+        # yfinanceで一括ダウンロード
         df_chunk = _yf_fetch_chunk(chunk, start_str, end_str)
         
         if not df_chunk.empty:
-            print(f" [Debug] DB Saving {len(df_chunk)} rows...", end="", flush=True)
             try:
                 db.save_prices(df_chunk)
                 saved_total += len(df_chunk)
-                print(" OK!")
             except Exception as e:
                 print(f" DB Error: {e}")
-        else:
-            print(" [Debug] No valid data found for this batch.")
         
+        # サーバーへの負荷軽減のため少し待機
         time.sleep(_YF_SLEEP)
 
-    total_rows = _count_rows(db)
-    print(f"\nBackfill complete: Saved {saved_total} / DB Total: {total_rows}")
-
+    print(f"\n✨ Backfill complete! Total Saved in this run: {saved_total}")
+    
 if __name__ == "__main__":
     backfill_data()
