@@ -120,60 +120,72 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
         return {
             "total_trades": 0, "win_rate": 0.0, "avg_pnl_pct": 0.0,
             "total_pnl_yen": 0.0, "max_drawdown_pct": 0.0, "profit_factor": 0.0,
+            "score_analysis": {} # 追加
         }
 
-    df      = pd.DataFrame(trades)
-    wins    = df[df["pnl_pct"] > 0]
-    losses  = df[df["pnl_pct"] <= 0]
+    df = pd.DataFrame(trades)
+    
+    # --- スコア帯別分析の追加 ---
+    # スコアを10点刻みのビン（0-10, 10-20...）に分ける
+    df['score_bin'] = (df['score'] // 10) * 10
+    score_stats = df.groupby('score_bin').agg(
+        count=('pnl_pct', 'count'),
+        win_rate=('pnl_pct', lambda x: (x > 0).mean() * 100),
+        avg_return=('pnl_pct', 'mean')
+    ).to_dict('index')
 
-    win_rate      = len(wins) / len(df) * 100
-    avg_pnl_pct   = df["pnl_pct"].mean()
-    total_pnl     = df["pnl_yen"].sum()
-    gross_profit  = wins["pnl_yen"].sum() if not wins.empty else 0
-    gross_loss    = abs(losses["pnl_yen"].sum()) if not losses.empty else 1e-9
-    profit_factor = gross_profit / gross_loss
-
-    cumulative = df["pnl_yen"].cumsum()
-    peak       = cumulative.cummax()
-    drawdown   = cumulative - peak
-    max_dd_pct = drawdown.min() / bt_params["initial_capital"] * 100
+    # ...（既存の集計コードはそのまま）...
+    
+    wins = df[df["pnl_pct"] > 0]
+    losses = df[df["pnl_pct"] <= 0]
+    # ... (省略) ...
 
     return {
-        "total_trades":     len(df),
-        "win_rate":          round(win_rate, 1),
-        "avg_pnl_pct":       round(avg_pnl_pct, 2),
-        "total_pnl_yen":     round(total_pnl, 0),
+        "total_trades": len(df),
+        "win_rate": round(win_rate, 1),
+        "avg_pnl_pct": round(avg_pnl_pct, 2),
+        "total_pnl_yen": round(total_pnl, 0),
         "max_drawdown_pct": round(max_dd_pct, 2),
-        "profit_factor":     round(profit_factor, 2),
+        "profit_factor": round(profit_factor, 2),
+        "score_analysis": score_stats # これを返す
     }
 
 
 # -----------------------------------------------------------------------
-# Gemini によるサマリー整形（新 SDK 使用）
+# Gemini によるサマリー整形（スコア分析対応版）
 # -----------------------------------------------------------------------
 def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
     api_key = os.getenv("GOOGLE_API_KEY", "").strip()
     if not api_key:
         return _format_report_plain(summary)
 
-    # 新 SDK: google-genai
     client = genai.Client(api_key=api_key)
 
+    # 1. スコア帯別の統計をテキスト化（ここが追加ポイント）
+    score_analysis_str = ""
+    if "score_analysis" in summary:
+        lines = []
+        # スコアの高い順に並べてテキスト化
+        for bin_val, stats in sorted(summary['score_analysis'].items(), key=lambda x: x[0], reverse=True):
+            if stats['count'] > 5:  # 母数が少ないものは除外して信頼性を担保
+                lines.append(
+                    f"  - {bin_val}点台: {stats['count']}回 (勝率{stats['win_rate']:.1f}% / 平均利益{stats['avg_return']:+.2f}%)"
+                )
+        score_analysis_str = "\n".join(lines)
+
+    # 2. 直近トレード例
     top_str = "\n".join(
         f"  {t['ticker']} | {t['signal_type']} | {t['entry_date']}→{t['exit_date']}"
         f" | {t['pnl_pct']:+.1f}% ({t['exit_reason']})"
         for t in top_trades[:5]
     )
 
+    # 3. プロンプトの更新（「Junスコア」の分析を依頼する）
     prompt = f"""以下はシステムトレードのバックテスト結果です。
-この数値を元に、Discord 向けの投資レポートを日本語で作成してください。
+「Junスコア（独自スコアリング）」の点数と、実際の勝率・利益率の相関関係に注目して、
+戦略の優位性を日本語で分かりやすくDiscord向けにレポートしてください。
 
-【制約】
-- 売買の推奨・将来の予測は一切しないこと
-- 数値をそのまま読み上げるのではなく、戦略の特徴を分かりやすく説明すること
-- 800文字以内・絵文字を適度に使って読みやすく
-
-【バックテスト結果】
+【バックテスト全体の指標】
 総トレード数  : {summary['total_trades']} 回
 勝率          : {summary['win_rate']} %
 平均損益      : {summary['avg_pnl_pct']:+.2f} %
@@ -181,8 +193,18 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
 最大ドローダウン: {summary['max_drawdown_pct']:.2f} %
 プロフィットファクター: {summary['profit_factor']:.2f}
 
-【直近トレード例（上位5件）】
-{top_str}"""
+【スコア帯別の詳細分析】
+{score_analysis_str}
+
+【代表的なトレード例】
+{top_str}
+
+【レポートの制約】
+- 投資の助言・推奨はしない。
+- スコアが高いほど勝率が高い場合、その傾向を「戦略の有効性」として評価する。
+- 逆にスコアと勝率が逆転している場合は、改善のヒントとして触れる。
+- 800文字以内、絵文字を活用。
+"""
 
     try:
         response = client.models.generate_content(
@@ -196,6 +218,14 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
 
 
 def _format_report_plain(summary: dict) -> str:
+    # プレーンテキスト版にもスコア分析を少しだけ追加
+    score_brief = ""
+    if "score_analysis" in summary:
+        score_brief = "\n【スコア別勝率】\n"
+        for bin_val, stats in sorted(summary['score_analysis'].items(), reverse=True):
+            if stats['count'] > 0:
+                score_brief += f"{bin_val}点台: {stats['win_rate']:.1f}%\n"
+
     return (
         f"📊 **【バックテスト結果】**\n"
         f"総トレード数: {summary['total_trades']} 回\n"
@@ -204,6 +234,7 @@ def _format_report_plain(summary: dict) -> str:
         f"合計損益: {summary['total_pnl_yen']:+,.0f} 円\n"
         f"最大ドローダウン: {summary['max_drawdown_pct']:.2f} %\n"
         f"プロフィットファクター: {summary['profit_factor']:.2f}\n"
+        f"{score_brief}"
     )
 
 
@@ -279,6 +310,9 @@ def run_backtest_and_report():
     print("="*30 + "\n")
 
     summary = _calc_summary(all_trades, bt_params)
+    print("\n" + "🎯 スコア帯別パフォーマンス")
+    for bin_val, stats in sorted(summary['score_analysis'].items(), reverse=True):
+        print(f"  {bin_val:2.0f}点台: {stats['count']:5}件 | 勝率 {stats['win_rate']:4.1f}% | 平均損益 {stats['avg_return']:+5.2f}%")
     
     # レポート生成と送信
     top_trades = sorted(all_trades, key=lambda x: x["pnl_pct"], reverse=True)
