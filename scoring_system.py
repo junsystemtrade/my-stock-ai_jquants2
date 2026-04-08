@@ -12,61 +12,44 @@ scoring_system.py
 import pandas as pd
 
 def calculate_score(row: pd.Series, scoring_cfg: dict = None) -> float:
-    """
-    銘柄の各種指標（row内）に基づき、0〜100点のスコアを算出する。
-    """
-    # 1. 基礎点（ここからスタート）
-    score = 50.0
+    # 1. 基礎点を 40.0 に引き下げ（ここから這い上がる銘柄を探す）
+    score = 40.0
 
-    # 2. 中期トレンド（地合い）の判定
-    # 銘柄が25日移動平均線より上にいるか（signal_engineで計算済み）
-    is_above_ma25 = row.get('is_above_ma25', False)
-    if is_above_ma25:
-        score += 10.0  # 上昇トレンドへの追随
+    # 2. 中期トレンド加点（最大 +20点）
+    if row.get('is_above_ma25', False):
+        score += 10.0
+        # 25日線が上向きならさらに加速
+        if row.get('ma25_upward', False):
+            score += 10.0
     else:
-        score -= 10.0  # 逆張りリスク（減点）
+        score -= 10.0
 
-    # 3. 出来高の勢い（モメンタム）
-    # 5日平均に対する当日出来高の倍率
+    # 3. 出来高の爆発力（最大 +30点）※ここを最も重視
     v_ratio = row.get('volume_ratio', 1.0)
     if v_ratio >= 3.0:
-        score += 20.0  # 異常な注目度（非常に強い加点）
+        score += 30.0  # 圧倒的な買い
     elif v_ratio >= 2.0:
-        score += 15.0
+        score += 20.0
     elif v_ratio >= 1.5:
-        score += 8.0
-    elif v_ratio < 0.6:
-        score -= 5.0   # 買い手不在
+        score += 10.0
+    elif v_ratio < 0.5:
+        score -= 10.0
 
-    # 4. 短期的な「下げすぎ」または「過熱」の判定
-    # 5日線乖離率（mavg_5_diff）
+    # 4. エントリー位置の最適化（最大 +10点 / 最小 -20点）
     diff5 = row.get('mavg_5_diff', 0.0)
-    if diff5 < -10.0:
-        # 下げの勢いが強すぎる場合は、リバウンド狙いよりもトレンド崩壊とみなして減点
-        score -= 15.0
-    elif -5.0 <= diff5 <= 2.0:
-        # 押し目、あるいは上昇の初動として理想的
-        score += 7.0
-    elif diff5 > 10.0:
-        # 短期的な急騰による高値掴みリスク
-        score -= 10.0
+    if 0.5 <= diff5 <= 3.5:
+        score += 10.0  # 理想的な初動
+    elif diff5 > 8.0:
+        score -= 20.0  # 飛びつき買い厳禁（過熱）
 
-    # 5. オシレーター（RSI）による補正
+    # 5. RSIの「余白」評価（最大 +10点 / 最小 -20点）
     rsi = row.get('rsi_14', 50.0)
-    if 45.0 <= rsi <= 65.0:
-        # ほどよい上昇余力
-        score += 5.0
+    if 50.0 <= rsi <= 65.0:
+        score += 10.0  # 上昇余力たっぷり
     elif rsi > 75.0:
-        # 買われすぎによる調整懸念
-        score -= 10.0
-    elif rsi < 25.0:
-        # 極端な売られすぎ（反発期待はあるがリスクも高い）
-        score -= 5.0
+        score -= 20.0  # 天井圏リスク
 
-    # 6. スコアの正規化（0点〜100点に収める）
-    final_score = float(max(0.0, min(100.0, score)))
-    
-    return round(final_score, 1)
+    return float(max(0.0, min(100.0, score)))
 
 if __name__ == "__main__":
     # テスト用ダミーデータ
