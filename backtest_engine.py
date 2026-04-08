@@ -2,6 +2,7 @@ import os
 import requests
 import pandas as pd
 from google import genai
+from datetime import datetime
 
 from database_manager import DBManager
 from signal_engine import _check_signals, _load_config
@@ -73,15 +74,14 @@ def _execute_trade(sig: dict, bt_params: dict) -> dict:
     }
 
 # -----------------------------------------------------------------------
-# 全体集計（スコア細分化対応）
+# 集計・レポート補助関数
 # -----------------------------------------------------------------------
 def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     if not trades:
-        return {"total_trades": 0, "win_rate": 0.0, "avg_pnl_pct": 0.0, "total_pnl_yen": 0.0, "max_drawdown_pct": 0.0, "profit_factor": 0.0, "score_analysis": {}}
+        return {"total_trades": 0, "win_rate": 0, "avg_pnl_pct": 0, "total_pnl_yen": 0, "max_drawdown_pct": 0, "profit_factor": 0, "score_analysis": {}}
 
     df = pd.DataFrame(trades)
     
-    # スコアカテゴリ分け
     def categorize_score(s):
         if s < 30: return "30点未満"
         if 30 <= s < 40: return "30点台"
@@ -92,10 +92,8 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
         return "80点以上"
 
     df['score_range'] = df['score'].apply(categorize_score)
-    order = ["80点以上", "70点台", "60点台", "50点台", "40点台", "30点台", "30点未満"]
-    
     score_stats = {}
-    for label in order:
+    for label in ["80点以上", "70点台", "60点台", "50点台", "40点台", "30点台", "30点未満"]:
         group = df[df['score_range'] == label]
         if not group.empty:
             score_stats[label] = {
@@ -104,42 +102,70 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
                 'avg_return': round(group['pnl_pct'].mean(), 2)
             }
 
-    # 全体集計
     wins = df[df["pnl_pct"] > 0]
     losses = df[df["pnl_pct"] <= 0]
-    total_count = len(df)
-    win_rate = len(wins) / total_count * 100
-    avg_pnl_pct = df["pnl_pct"].mean()
     total_pnl = df["pnl_yen"].sum()
     gross_profit = wins["pnl_yen"].sum() if not wins.empty else 0
     gross_loss = abs(losses["pnl_yen"].sum()) if not losses.empty else 1e-9
-    profit_factor = gross_profit / gross_loss
 
     cumulative = df["pnl_yen"].cumsum()
     peak = cumulative.cummax()
-    drawdown = cumulative - peak
-    max_dd_pct = (drawdown.min() / bt_params["initial_capital"] * 100)
+    max_dd = (cumulative - peak).min()
 
     return {
-        "total_trades": total_count,
-        "win_rate": round(win_rate, 1),
-        "avg_pnl_pct": round(avg_pnl_pct, 2),
+        "total_trades": len(df),
+        "win_rate": round(len(wins) / len(df) * 100, 1),
+        "avg_pnl_pct": round(df["pnl_pct"].mean(), 2),
         "total_pnl_yen": round(total_pnl, 0),
-        "max_drawdown_pct": round(max_dd_pct, 2),
-        "profit_factor": round(profit_factor, 2),
+        "max_drawdown_pct": round(max_dd / bt_params["initial_capital"] * 100, 2),
+        "profit_factor": round(gross_profit / gross_loss, 2),
         "score_analysis": score_stats
     }
 
-# (中略: _format_report_with_gemini, _format_report_plain, _send_discord はあなたの提示したものでOK)
+def _format_report_plain(summary: dict) -> str:
+    score_brief = "\n【スコア別分析】\n"
+    for k, v in summary['score_analysis'].items():
+        score_brief += f"{k}: {v['count']}回 | 勝率{v['win_rate']}% | 平均{v['avg_return']:+.2f}%\n"
+    
+    return (
+        f"📊 **バックテスト結果(厳選モード)**\n"
+        f"総数: {summary['total_trades']}回 / 勝率: {summary['win_rate']}%\n"
+        f"平均損益: {summary['avg_pnl_pct']:+.2f}% / 合計: {summary['total_pnl_yen']:+,.0f}円\n"
+        f"PF: {summary['profit_factor']} / 最大DD: {summary['max_drawdown_pct']}%\n"
+        f"{score_brief}"
+    )
+
+def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key: return _format_report_plain(summary)
+    
+    client = genai.Client(api_key=api_key)
+    prompt = f"以下は独自スコアを用いた株バックテスト結果です。スコアと勝率の相関を分析し、Discord用に800文字以内で要約して。\n\n結果:\n{summary}\n\n上位例:\n{top_trades[:3]}"
+    try:
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        return response.text.strip()
+    except:
+        return _format_report_plain(summary)
+
+def _send_discord(content: str):
+    url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if url: requests.post(url, json={"content": content[:1990]})
+
+def _process_results(trades, bt_params):
+    if not trades:
+        print("有効なトレードなし"); return
+    summary = _calc_summary(trades, bt_params)
+    print(_format_report_plain(summary))
+    report = _format_report_with_gemini(summary, sorted(trades, key=lambda x: x["pnl_pct"], reverse=True))
+    _send_discord(f"📈 **精鋭バックテストレポート**\n{report}")
 
 # -----------------------------------------------------------------------
-# 公開インターフェース（修正版）
+# メイン
 # -----------------------------------------------------------------------
 def run_backtest_and_report():
     print("📊 バックテスト開始（精鋭選別モード）...")
     cfg = _load_config()
     bt_params = _load_bt_params()
-    
     db = DBManager()
     df_all = db.load_analysis_data(days=365 * 3)
     if df_all.empty: return
@@ -153,19 +179,21 @@ def run_backtest_and_report():
         min_days = cfg.get("filter", {}).get("min_data_days", 80)
         for i in range(min_days, len(df_ticker) - 1):
             window_df = df_ticker.iloc[: i + 1]
-            if _check_signals(ticker, window_df, cfg):
+            hits = _check_signals(ticker, window_df, cfg)
+            if hits:
                 entry_row = df_ticker.iloc[i + 1]
                 score = calculate_score(entry_row, cfg.get('scoring_logic', {}))
                 all_potential_signals.append({
                     "date": entry_row["date"], "ticker": ticker, "score": score,
-                    "signal_type": "GoldenCross", "df_ticker": df_ticker, "entry_idx": i + 1
+                    "signal_type": hits[0]["signal_type"], "df_ticker": df_ticker, "entry_idx": i + 1
                 })
 
     if not all_potential_signals:
-        print("シグナルなし。"); return
+        print("シグナルなし"); return
 
     sig_df = pd.DataFrame(all_potential_signals)
-    # 日付ごとにスコア上位3つを抽出
+    # 型不一致回避のため Timestamp に統一してソート
+    sig_df["date"] = pd.to_datetime(sig_df["date"])
     selected_signals = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
 
     final_trades = []
@@ -173,8 +201,11 @@ def run_backtest_and_report():
 
     for _, sig in selected_signals.sort_values("date").iterrows():
         ticker = sig["ticker"]
-        if ticker in ticker_free_date and sig["date"] < ticker_free_date[ticker]:
+        exec_ts = sig["date"] # すでに Timestamp
+
+        if ticker in ticker_free_date and exec_ts < ticker_free_date[ticker]:
             continue
+
         trade = _execute_trade(sig, bt_params)
         if trade:
             final_trades.append(trade)
