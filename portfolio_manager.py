@@ -210,15 +210,4 @@ def backfill_data():
     print(f"\n✨ Backfill complete! Total Saved in this run: {saved_total}")
 
 if __name__ == "__main__":
-    # テストとして日経先物だけを即座に取得・保存する
-    db = database_manager.DBManager()
-    target_ticker = "NIY=F"
-    start = "2021-01-01"
-    end = "2026-04-08" # 今日の日付
-    print(f"Fetching {target_ticker}...")
-    df = _yf_fetch_single(target_ticker, start, end)
-    if not df.empty:
-        db.save_prices(df)
-        print("Successfully saved NIY=F to DB!")
-    else:
-        print("Failed to fetch data.")
+    backfill_data()
