@@ -20,7 +20,8 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60    # バックテストは時間がかかるため長めに設定
+    # 無料枠の限界値である6時間（360分）に設定
+    timeout-minutes: 360
 
     env:
       DATABASE_URL:        ${{ secrets.DATABASE_URL }}
@@ -28,6 +29,8 @@ jobs:
       GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       NOTIFY_DISCORD:      ${{ github.event.inputs.notify_discord }}
+      # Pythonのバッファリングを無効化し、ログをリアルタイムでActions画面に表示させる
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: ☁️ リポジトリをチェックアウト
@@ -43,4 +46,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: 📊 バックテスト実行
+        # 実行時の標準出力を維持
         run: python backtest_engine.py
+
+      - name: 📝 最終ステータス通知（失敗時のみ）
+        if: failure()
+        run: |
+          MSG="❌ **バックテスト失敗**: 6時間のタイムアウト、もしくはエラーにより中断されました。"
+          curl -s -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"$MSG\"}"
