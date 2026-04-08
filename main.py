@@ -23,19 +23,22 @@ from signal_engine import _load_config
 # -----------------------------------------------------------------------
 def check_market_health(cfg: dict) -> tuple[bool, float]:
     """
-    前日の市場（日経平均等）が暴落していないか確認する。
+    今朝 06:00 までの日経平均先物（CME等）の動きを確認する。
     """
     breaker_cfg = cfg.get("filter", {}).get("market_breaker", {})
     if not breaker_cfg.get("enabled", False):
         return False, 0.0
 
-    symbol = breaker_cfg.get("symbol", "^N225")
+    # 現物 (^N225) ではなく先物 (NIY=F) を使用
+    symbol = breaker_cfg.get("symbol", "NIY=F") 
     threshold = breaker_cfg.get("drop_threshold_pct", -1.5)
 
     try:
         ticker_yf = yf.Ticker(symbol)
+        # 先物はほぼ24時間動いているため、直近の終値と1日前の終値を比較
         hist = ticker_yf.history(period="2d")
         if len(hist) < 2:
+            print(f"⚠️ 市場データ不足: {symbol}")
             return False, 0.0
 
         prev_close = hist["Close"].iloc[-2]
