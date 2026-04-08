@@ -47,27 +47,26 @@ def _load_config() -> dict:
 # 指標計算（スコアリング用拡張）
 # -----------------------------------------------------------------------
 def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    スコアリングとシグナル判定に必要なテクニカル指標を一括計算する。
-    """
     df = df.copy()
     close = df["price"].astype(float)
     volume = df["volume"].astype(float)
 
-    # 1. 出来高比（5日平均出来高に対する当日出来高の倍率）
+    # 1. 出来高比
     volume_ma5 = volume.rolling(window=5).mean()
     df['volume_ratio'] = volume / volume_ma5.shift(1)
 
-    # 2. 5日線乖離率（短期的な下げすぎ・過熱の判定用）
+    # 2. 5日線乖離率
     ma5 = close.rolling(window=5).mean()
     df['mavg_5_diff'] = (close - ma5) / ma5 * 100
 
-    # 3. 25日線地合い（中期トレンドの判定用）
+    # 3. 25日線地合い & トレンドの向き
     ma25 = close.rolling(window=25).mean()
     df['ma25'] = ma25
     df['is_above_ma25'] = close > ma25
+    # 【追加】25日線自体が上向いているか
+    df['ma25_upward'] = ma25 > ma25.shift(1)
 
-    # 4. RSI（買われすぎ・売られすぎ）
+    # 4. RSI
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window=14).mean()
     loss = (-delta.clip(upper=0)).rolling(window=14).mean()
