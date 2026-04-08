@@ -13,14 +13,14 @@ import database_manager
 # -----------------------------------------------------------------------
 # 設定定数
 # -----------------------------------------------------------------------
-BACKFILL_YEARS    = 3
-_YF_SINGLE_SLEEP  = float(os.getenv("YF_SINGLE_SLEEP", "0.1"))
-_YF_CHUNK_SIZE    = int(os.getenv("YF_CHUNK_SIZE", "50"))
-_YF_SLEEP         = float(os.getenv("YF_SLEEP_SEC", "3.0"))
-_DB_CHUNK_SIZE    = int(os.getenv("DB_CHUNK_SIZE", "1000"))
-BASE_API          = "https://api.jquants.com/v2"
+BACKFILL_YEARS = 3
+_YF_SINGLE_SLEEP = float(os.getenv("YF_SINGLE_SLEEP", "0.1"))
+_YF_CHUNK_SIZE = int(os.getenv("YF_CHUNK_SIZE", "50"))
+_YF_SLEEP = float(os.getenv("YF_SLEEP_SEC", "3.0"))
+_DB_CHUNK_SIZE = int(os.getenv("DB_CHUNK_SIZE", "1000"))
+BASE_API = "https://api.jquants.com/v2"
 EQ_DAILY_ENDPOINT = "/equities/bars/daily"
-_SAMPLE_CODES     = ["72030", "86580", "90840", "30480"]
+_SAMPLE_CODES = ["72030", "86580", "90840", "30480"]
 _JQUANTS_INTERVAL = float(os.getenv("JQUANTS_MIN_INTERVAL_SEC", "12.5"))
 
 # 【追加】市場インデックス用のティッカー定義
