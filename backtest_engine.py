@@ -17,6 +17,7 @@ _DEFAULT_BT_PARAMS = {
     "initial_capital":  1_000_000,
     "position_size":    0.1,
     "max_daily_entries": 3, 
+    "market_crash_limit": -2.0  # 日経先物が前日比-2%以下ならエントリー見送り
 }
 
 def _load_bt_params() -> dict:
@@ -34,27 +35,31 @@ def _execute_trade(sig: dict, bt_params: dict) -> dict:
     stop_loss = bt_params["stop_loss_pct"] / 100
     
     entry_row = df.iloc[idx]
-    entry_price = float(entry_row["open"]) if pd.notna(entry_row["open"]) else float(entry_row["price"])
+    # エントリーは翌朝の始値を想定（始値がなければprice）
+    entry_price = float(entry_row["open"]) if pd.notna(entry_row["open"]) and entry_row["open"] > 0 else float(entry_row["price"])
     if entry_price <= 0: return None
 
     exit_price = None
     exit_date = None
     exit_reason = "期間満了"
 
+    # ストップロス判定（期間中の安値をチェック）
     for j in range(idx + 1, min(idx + 1 + hold_days, len(df))):
-        prev_row = df.iloc[j-1] 
-        curr_row = df.iloc[j]   
+        curr_row = df.iloc[j]
+        low_price = float(curr_row["low"]) if pd.notna(curr_row["low"]) else float(curr_row["price"])
         
-        if (float(prev_row["price"]) - entry_price) / entry_price <= -stop_loss:
-            exit_price = float(curr_row["open"]) if pd.notna(curr_row["open"]) else float(curr_row["price"])
+        if (low_price - entry_price) / entry_price <= -stop_loss:
+            # 損切りは翌日の始値（または損切りライン）で実行
+            exit_price = entry_price * (1 - stop_loss)
             exit_date = curr_row["date"]
-            exit_reason = "ストップロス(翌朝決済)"
+            exit_reason = "ストップロス"
             break
 
+    # 期間満了時の決済
     if exit_price is None:
         exit_idx = min(idx + hold_days, len(df) - 1)
         exit_row = df.iloc[exit_idx]
-        exit_price = float(exit_row["open"]) if pd.notna(exit_row["open"]) else float(exit_row["price"])
+        exit_price = float(exit_row["open"]) if pd.notna(exit_row["open"]) and exit_row["open"] > 0 else float(exit_row["price"])
         exit_date = exit_row["date"]
 
     pnl_pct = (exit_price - entry_price) / entry_price * 100
@@ -64,9 +69,9 @@ def _execute_trade(sig: dict, bt_params: dict) -> dict:
         "ticker": sig["ticker"],
         "score": sig["score"],
         "signal_type": sig["signal_type"],
-        "entry_date": str(entry_row["date"]),
+        "entry_date": entry_row["date"],
         "entry_price": round(entry_price, 2),
-        "exit_date": str(exit_date),
+        "exit_date": exit_date,
         "exit_price": round(exit_price, 2),
         "pnl_pct": round(pnl_pct, 2),
         "pnl_yen": round(pnl_yen, 0),
@@ -114,7 +119,7 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
 
     return {
         "total_trades": len(df),
-        "win_rate": round(len(wins) / len(df) * 100, 1),
+        "win_rate": round(len(wins) / len(df) * 100, 1) if len(df) > 0 else 0,
         "avg_pnl_pct": round(df["pnl_pct"].mean(), 2),
         "total_pnl_yen": round(total_pnl, 0),
         "max_drawdown_pct": round(max_dd / bt_params["initial_capital"] * 100, 2),
@@ -140,7 +145,7 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
     if not api_key: return _format_report_plain(summary)
     
     client = genai.Client(api_key=api_key)
-    prompt = f"以下は独自スコアを用いた株バックテスト結果です。スコアと勝率の相関を分析し、Discord用に800文字以内で要約して。\n\n結果:\n{summary}\n\n上位例:\n{top_trades[:3]}"
+    prompt = f"以下は独自スコアリングを用いた日本株バックテスト結果です。市場環境（地合い）を考慮した取引の結果について分析し、今後の戦略へのアドバイスをDiscord用に要約して。\n\n結果:\n{summary}\n\n上位成功例:\n{top_trades[:3]}"
     try:
         response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return response.text.strip()
@@ -155,7 +160,8 @@ def _process_results(trades, bt_params):
     if not trades:
         print("有効なトレードなし"); return
     summary = _calc_summary(trades, bt_params)
-    print(_format_report_plain(summary))
+    plain_text = _format_report_plain(summary)
+    print(plain_text)
     report = _format_report_with_gemini(summary, sorted(trades, key=lambda x: x["pnl_pct"], reverse=True))
     _send_discord(f"📈 **精鋭バックテストレポート**\n{report}")
 
@@ -163,28 +169,42 @@ def _process_results(trades, bt_params):
 # メイン
 # -----------------------------------------------------------------------
 def run_backtest_and_report():
-    print("📊 バックテスト開始（精鋭選別モード）...")
+    print("📊 バックテスト開始（地合いフィルター & 精鋭選別モード）...")
     cfg = _load_config()
     bt_params = _load_bt_params()
     db = DBManager()
     df_all = db.load_analysis_data(days=365 * 3)
     if df_all.empty: return
 
+    # --- 市場地合い(NIY=F)データの事前準備 ---
+    niy_df = df_all[df_all["ticker"] == "NIY=F"].sort_values("date").copy()
+    niy_df["market_change"] = niy_df["price"].pct_change() * 100
+    market_crash_dates = niy_df[niy_df["market_change"] <= bt_params["market_crash_limit"]]["date"].tolist()
+    
     all_potential_signals = []
-    tickers = df_all["ticker"].unique()
+    tickers = [t for t in df_all["ticker"].unique() if t != "NIY=F"]
     print(f"🔍 {len(tickers):,} 銘柄からシグナル抽出...")
 
     for ticker in tickers:
         df_ticker = df_all[df_all["ticker"] == ticker].sort_values("date").reset_index(drop=True)
         min_days = cfg.get("filter", {}).get("min_data_days", 80)
+        
         for i in range(min_days, len(df_ticker) - 1):
+            entry_row = df_ticker.iloc[i + 1]
+            entry_date = entry_row["date"]
+            
+            # 【地合いフィルター】前日に日経先物が暴落していたら、翌日のエントリーは見送り
+            if entry_date in market_crash_dates:
+                continue
+
             window_df = df_ticker.iloc[: i + 1]
             hits = _check_signals(ticker, window_df, cfg)
+            
             if hits:
-                entry_row = df_ticker.iloc[i + 1]
+                # スコア計算
                 score = calculate_score(entry_row, cfg.get('scoring_logic', {}))
                 all_potential_signals.append({
-                    "date": entry_row["date"], "ticker": ticker, "score": score,
+                    "date": entry_date, "ticker": ticker, "score": score,
                     "signal_type": hits[0]["signal_type"], "df_ticker": df_ticker, "entry_idx": i + 1
                 })
 
@@ -192,8 +212,9 @@ def run_backtest_and_report():
         print("シグナルなし"); return
 
     sig_df = pd.DataFrame(all_potential_signals)
-    # 型不一致回避のため Timestamp に統一してソート
     sig_df["date"] = pd.to_datetime(sig_df["date"])
+    
+    # 日ごとにスコア上位のみを選択
     selected_signals = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
 
     final_trades = []
@@ -201,15 +222,16 @@ def run_backtest_and_report():
 
     for _, sig in selected_signals.sort_values("date").iterrows():
         ticker = sig["ticker"]
-        exec_ts = sig["date"] # すでに Timestamp
+        exec_ts = sig["date"]
 
-        if ticker in ticker_free_date and exec_ts < ticker_free_date[ticker]:
+        # 同一銘柄の保有期間重複を避ける
+        if ticker in ticker_free_date and exec_ts < pd.to_datetime(ticker_free_date[ticker]):
             continue
 
         trade = _execute_trade(sig, bt_params)
         if trade:
             final_trades.append(trade)
-            ticker_free_date[ticker] = pd.to_datetime(trade["exit_date"])
+            ticker_free_date[ticker] = trade["exit_date"]
 
     _process_results(final_trades, bt_params)
 
