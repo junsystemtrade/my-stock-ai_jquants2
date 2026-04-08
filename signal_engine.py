@@ -2,10 +2,7 @@
 signal_engine.py
 ================
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
-
-修正ポイント:
-  - 出来高比 (volume_ratio)、5日線乖離率 (mavg_5_diff)、25日線地合い (is_above_ma25) の計算を追加。
-  - バックテスト時にこれらの指標を scoring_system に渡せるようデータフレームを拡張。
+日経平均先物(NIY=F)の地合い判定を全シグナルに統合。
 """
 
 import os
@@ -16,7 +13,9 @@ import re
 import pandas as pd
 from pathlib import Path
 from google import genai
+from sqlalchemy import text
 
+import database_manager
 
 # -----------------------------------------------------------------------
 # シグナル設定の読み込み
@@ -42,6 +41,44 @@ def _load_config() -> dict:
         },
     }
 
+# -----------------------------------------------------------------------
+# 地合い判定（NIY=F活用）
+# -----------------------------------------------------------------------
+def _get_market_condition() -> tuple[float, str]:
+    """
+    データベースから日経平均先物(NIY=F)の直近2日分を取得し、地合いを計算。
+    """
+    db = database_manager.DBManager()
+    query = text("""
+        SELECT price, date FROM daily_prices 
+        WHERE ticker = 'NIY=F' 
+        ORDER BY date DESC LIMIT 2
+    """)
+    
+    try:
+        with db.engine.connect() as conn:
+            df_niy = pd.read_sql(query, conn)
+        
+        if len(df_niy) < 2:
+            return 0.0, "不明"
+
+        latest_price = float(df_niy['price'].iloc[0])
+        prev_price = float(df_niy['price'].iloc[1])
+        market_change_pct = (latest_price - prev_price) / prev_price * 100
+        
+        if market_change_pct <= -2.0:
+            status = "暴落警戒"
+        elif market_change_pct <= -0.5:
+            status = "軟調"
+        elif market_change_pct >= 0.5:
+            status = "好調"
+        else:
+            status = "平穏"
+            
+        return market_change_pct, status
+    except Exception as e:
+        print(f" [Warning] Market condition check failed: {e}")
+        return 0.0, "エラー"
 
 # -----------------------------------------------------------------------
 # 指標計算（スコアリング用拡張）
@@ -63,7 +100,6 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ma25 = close.rolling(window=25).mean()
     df['ma25'] = ma25
     df['is_above_ma25'] = close > ma25
-    # 【追加】25日線自体が上向いているか
     df['ma25_upward'] = ma25 > ma25.shift(1)
 
     # 4. RSI
@@ -75,7 +111,6 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 # -----------------------------------------------------------------------
 # ETF・REIT 除外チェック
 # -----------------------------------------------------------------------
@@ -84,7 +119,9 @@ def _is_excluded(ticker: str, cfg: dict) -> bool:
     exclude_ranges = filter_cfg.get("exclude_code_range", [])
 
     try:
-        code = int(ticker.replace(".T", "").strip())
+        code_str = ticker.replace(".T", "").strip()
+        if not code_str.isdigit(): return False
+        code = int(code_str)
     except ValueError:
         return False
 
@@ -93,21 +130,16 @@ def _is_excluded(ticker: str, cfg: dict) -> bool:
             return True
     return False
 
-
 # -----------------------------------------------------------------------
 # シグナル判定（1 銘柄ぶん）
 # -----------------------------------------------------------------------
 def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
-    """
-    1 銘柄の DataFrame に対してシグナル判定を行う。
-    内部で _calculate_indicators を呼び出し、スコアリング用データを付与する。
-    """
     # 指標計算
     df = _calculate_indicators(df)
     
     signals_cfg = cfg.get("signals", {})
     filter_cfg  = cfg.get("filter", {})
-    results     = []
+    results      = []
 
     if _is_excluded(ticker, cfg):
         return []
@@ -130,7 +162,6 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     if gc_cfg.get("enabled", True):
         short_w = gc_cfg.get("short_window", 25)
         long_w  = gc_cfg.get("long_window", 75)
-        # 移動平均は既存のものを使用、またはここで再計算（柔軟性のため）
         sma_s = df["price"].rolling(window=short_w).mean()
         sma_l = df["price"].rolling(window=long_w).mean()
         
@@ -142,7 +173,7 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
             })
 
     # ---- ② RSI 売られすぎ ----
-    rsi_cfg = rsi_cfg = signals_cfg.get("rsi_oversold", {})
+    rsi_cfg = signals_cfg.get("rsi_oversold", {})
     if rsi_cfg.get("enabled", True):
         threshold = rsi_cfg.get("threshold", 30)
         rsi_val = latest_row["rsi_14"]
@@ -172,50 +203,40 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     max_signals = filter_cfg.get("max_signals_per_ticker", 1)
     results = sorted(results, key=lambda x: x["priority"])[:max_signals]
 
-    # スコアリングに必要な最新行の全データをシグナル情報に結合
+    # スコアリング用データを結合
     for r in results:
         r["ticker"] = ticker
         r["price"]  = latest_price
-        # latest_row の全指標（volume_ratio, mavg_5_diff 等）を辞書として統合
         r.update(latest_row.to_dict())
 
     return results
 
-
 # -----------------------------------------------------------------------
-# Gemini 企業調査・公開インターフェース（既存ロジック維持）
+# メインスキャン
 # -----------------------------------------------------------------------
-def _get_company_name(ticker: str, ticker_map: dict) -> str:
-    info = ticker_map.get(ticker, {})
-    name = info.get("name", "")
-    return name if name and name not in ("nan", "None", "") else ticker.replace(".T", "")
-
-def _research_company(client: genai.Client, ticker: str, company_name: str, signal_type: str, reason: str, max_retries: int = 3) -> dict:
-    code = ticker.replace(".T", "")
-    prompt = f"銘柄コード: {code}, 会社名: {company_name}, シグナル: {signal_type} ({reason}) について主力事業、直近トピック、シグナルの関連性をJSON形式で調査して。"
-    # (既存の _research_company 実装をここに維持)
-    # 簡略化のため中身は省略しますが、以前のコードのままで動作します
-    return {"business": "...", "topic": "...", "context": "..."}
-
 def scan_signals(daily_data: pd.DataFrame) -> list[dict]:
     if daily_data.empty: return []
     cfg = _load_config()
-    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    client = genai.Client(api_key=api_key)
     
-    try:
-        from portfolio_manager import get_target_tickers
-        ticker_map = get_target_tickers()
-    except:
-        ticker_map = {}
+    # 地合いデータの取得
+    m_change, m_status = _get_market_condition()
+    print(f"📊 市場地合い: {m_status} (NIY=F 前日比: {m_change:.2f}%)")
 
     all_signals = []
     tickers = daily_data["ticker"].unique()
+    
     for ticker in tickers:
+        # 指標銘柄自体はスキャン対象外
+        if ticker == "NIY=F": continue
+        
         df_ticker = daily_data[daily_data["ticker"] == ticker].sort_values("date").reset_index(drop=True)
         hits = _check_signals(ticker, df_ticker, cfg)
+        
+        # 全シグナルに地合い情報を付与
+        for h in hits:
+            h["market_change_pct"] = m_change
+            h["market_status"] = m_status
+        
         all_signals.extend(hits)
 
-    # 実運用スキャン時は Gemini 調査を行う
-    # (既存の調査ループをここに維持)
     return all_signals
