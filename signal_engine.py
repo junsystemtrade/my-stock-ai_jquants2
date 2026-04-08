@@ -6,15 +6,10 @@ signal_engine.py
 """
 
 import os
-import time
 import yaml
-import json
-import re
 import pandas as pd
 from pathlib import Path
-from google import genai
 from sqlalchemy import text
-
 import database_manager
 
 # -----------------------------------------------------------------------
@@ -49,6 +44,7 @@ def _get_market_condition() -> tuple[float, str]:
     データベースから日経平均先物(NIY=F)の直近2日分を取得し、地合いを計算。
     """
     db = database_manager.DBManager()
+    # 最新の2件を取得
     query = text("""
         SELECT price, date FROM daily_prices 
         WHERE ticker = 'NIY=F' 
@@ -66,6 +62,7 @@ def _get_market_condition() -> tuple[float, str]:
         prev_price = float(df_niy['price'].iloc[1])
         market_change_pct = (latest_price - prev_price) / prev_price * 100
         
+        # 地合いステータスの判定
         if market_change_pct <= -2.0:
             status = "暴落警戒"
         elif market_change_pct <= -0.5:
@@ -88,7 +85,7 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["price"].astype(float)
     volume = df["volume"].astype(float)
 
-    # 1. 出来高比
+    # 1. 出来高比（直近出来高 / 5日平均出来高）
     volume_ma5 = volume.rolling(window=5).mean()
     df['volume_ratio'] = volume / volume_ma5.shift(1)
 
@@ -102,10 +99,11 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['is_above_ma25'] = close > ma25
     df['ma25_upward'] = ma25 > ma25.shift(1)
 
-    # 4. RSI
+    # 4. RSI (14日)
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window=14).mean()
     loss = (-delta.clip(upper=0)).rolling(window=14).mean()
+    # ゼロ除算回避
     rs = gain / loss.replace(0, float("nan"))
     df['rsi_14'] = 100 - (100 / (1 + rs))
 
@@ -134,13 +132,14 @@ def _is_excluded(ticker: str, cfg: dict) -> bool:
 # シグナル判定（1 銘柄ぶん）
 # -----------------------------------------------------------------------
 def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
-    # 指標計算
+    # 指標計算を適用
     df = _calculate_indicators(df)
     
     signals_cfg = cfg.get("signals", {})
     filter_cfg  = cfg.get("filter", {})
     results      = []
 
+    # 除外リスト・データ数チェック
     if _is_excluded(ticker, cfg):
         return []
 
@@ -165,7 +164,10 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
         sma_s = df["price"].rolling(window=short_w).mean()
         sma_l = df["price"].rolling(window=long_w).mean()
         
-        if (len(sma_s.dropna()) >= 2 and sma_s.iloc[-2] <= sma_l.iloc[-2] and sma_s.iloc[-1] > sma_l.iloc[-1]):
+        # クロス判定（前日: 短期<=長期 かつ 当日: 短期>長期）
+        if (len(sma_s.dropna()) >= 2 and 
+            sma_s.iloc[-2] <= sma_l.iloc[-2] and 
+            sma_s.iloc[-1] > sma_l.iloc[-1]):
             results.append({
                 "signal_type": "ゴールデンクロス",
                 "reason": f"短期MA({short_w}日)が長期MA({long_w}日)を上抜け",
@@ -199,14 +201,15 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     if not results:
         return []
 
-    # 優先順位で絞り込み
+    # 優先順位で銘柄あたりの最大シグナル数に絞り込み
     max_signals = filter_cfg.get("max_signals_per_ticker", 1)
     results = sorted(results, key=lambda x: x["priority"])[:max_signals]
 
-    # スコアリング用データを結合
+    # スコアリングに必要な全データを辞書として統合
     for r in results:
         r["ticker"] = ticker
         r["price"]  = latest_price
+        # latest_row の全ての計算済み指標（volume_ratio, rsi_14等）をマージ
         r.update(latest_row.to_dict())
 
     return results
@@ -218,7 +221,7 @@ def scan_signals(daily_data: pd.DataFrame) -> list[dict]:
     if daily_data.empty: return []
     cfg = _load_config()
     
-    # 地合いデータの取得
+    # 全体地合いの取得
     m_change, m_status = _get_market_condition()
     print(f"📊 市場地合い: {m_status} (NIY=F 前日比: {m_change:.2f}%)")
 
@@ -226,13 +229,14 @@ def scan_signals(daily_data: pd.DataFrame) -> list[dict]:
     tickers = daily_data["ticker"].unique()
     
     for ticker in tickers:
-        # 指標銘柄自体はスキャン対象外
-        if ticker == "NIY=F": continue
+        # 指標銘柄自体（NIY=F）はスキャン対象外
+        if ticker == "NIY=F":
+            continue
         
         df_ticker = daily_data[daily_data["ticker"] == ticker].sort_values("date").reset_index(drop=True)
         hits = _check_signals(ticker, df_ticker, cfg)
         
-        # 全シグナルに地合い情報を付与
+        # 個別銘柄のシグナルに全体地合いのメタデータを付与
         for h in hits:
             h["market_change_pct"] = m_change
             h["market_status"] = m_status
