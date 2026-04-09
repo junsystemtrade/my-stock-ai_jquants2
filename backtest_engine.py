@@ -183,16 +183,23 @@ def run_backtest_and_report():
         if len(df_ticker) < min_days: continue
         
         for i in range(min_days, len(df_ticker) - 1):
-            entry_date = df_ticker.iloc[i + 1]["date"]
-            if entry_date in crash_dates: continue
+    entry_date = df_ticker.iloc[i + 1]["date"]
+    if entry_date in crash_dates: continue
 
-            hits = _check_signals(ticker, df_ticker.iloc[:i+1], cfg)
-            if hits:
-                score = calculate_score(df_ticker.iloc[i], cfg.get('scoring_logic', {}))
-                all_signals.append({
-                    "date": pd.to_datetime(entry_date), "ticker": ticker, "score": score,
-                    "signal_type": hits[0]["signal_type"], "df_ticker": df_ticker, "entry_idx": i + 1
-                })
+    # _check_signals は内部で _calculate_indicators を呼び、
+    # 指標を含んだ辞書（hits）を返すように設計されているため、これを利用する
+    hits = _check_signals(ticker, df_ticker.iloc[:i+1], cfg)
+    if hits:
+        # hits[0] には row.to_dict() によって全指標（mavg_25_diff等）が含まれている
+        score = calculate_score(pd.Series(hits[0]), cfg.get('scoring_logic', {}))
+        all_signals.append({
+            "date": pd.to_datetime(entry_date), 
+            "ticker": ticker, 
+            "score": score,
+            "signal_type": hits[0]["signal_type"], 
+            "df_ticker": df_ticker, 
+            "entry_idx": i + 1
+        })
 
     if not all_signals:
         print("シグナルが検出されませんでした。"); return
