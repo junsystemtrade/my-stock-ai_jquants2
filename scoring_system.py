@@ -18,47 +18,28 @@ def _linear_scale(val, min_val, max_val, score_max):
     return max(0.0, min(float(score_max), ratio * score_max))
 
 def calculate_score(row: pd.Series, scoring_cfg: dict = None) -> float:
-    """
-    configの scoring_logic パラメータを使用してスコアを算出する。
-    """
-    # 設定の読み込み（未指定時はデフォルト値を使用）
     cfg = scoring_cfg if scoring_cfg else {}
-    weights = cfg.get('weights', {
-        'volume_surge': 40,
-        'bias_proximity': 30,
-        'rsi_position': 20,
-        'liquidity_scale': 10
-    })
-    params = cfg.get('parameters', {
-        'volume_max_multiplier': 5.0,
-        'bias_limit_pct': 10.0,
-        'turnover_ideal_min': 1000000000,
-        'rsi_ideal_range': [40, 65]
-    })
+    weights = cfg.get('weights', {'volume_surge': 40, 'bias_proximity': 30, 'rsi_position': 20, 'liquidity_scale': 10})
+    params = cfg.get('parameters', {'volume_max_multiplier': 5.0, 'bias_limit_pct': 10.0, 'turnover_ideal_min': 1000000000, 'rsi_ideal_range': [40, 65]})
 
     total_score = 0.0
 
-    # --- 1. 出来高スコア (最大 40点) ---
-    # 出来高比 1.0(0点) 〜 5.0(満点) で計算
+    # 1. 出来高スコア (volume_ratio を使用)
     v_ratio = row.get('volume_ratio', 1.0)
     total_score += _linear_scale(v_ratio, 1.0, params['volume_max_multiplier'], weights['volume_surge'])
 
-    # --- 2. 25日線乖離率スコア (最大 30点) ---
-    # 25日線に近いほど加点（離れすぎると減点）
-    # 乖離 0%(満点) 〜 bias_limit_pct(0点)
-    bias = abs(row.get('mavg_25_diff', 0.0)) # 25日乖離率（絶対値）
+    # 2. 25日線乖離率スコア (mavg_25_diff を使用)
+    bias = abs(row.get('mavg_25_diff', 0.0))
     bias_score = weights['bias_proximity'] - _linear_scale(bias, 0.0, params['bias_limit_pct'], weights['bias_proximity'])
     total_score += max(0.0, bias_score)
 
-    # --- 3. RSI位置スコア (最大 20点) ---
-    # 指定された理想範囲 (40〜65) に入っていれば満点、外れていれば0点
+    # 3. RSIスコア (rsi_14 を使用)
     rsi = row.get('rsi_14', 50.0)
     r_min, r_max = params['rsi_ideal_range']
     if r_min <= rsi <= r_max:
         total_score += weights['rsi_position']
 
-    # --- 4. 流動性スコア (最大 10点) ---
-    # 売買代金（価格 × 出来高）が turnover_ideal_min (10億円) で満点
+    # 4. 流動性スコア (売買代金)
     turnover = float(row.get('price', 0)) * float(row.get('volume', 0))
     total_score += _linear_scale(turnover, 0, params['turnover_ideal_min'], weights['liquidity_scale'])
 
