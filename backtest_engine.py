@@ -2,7 +2,7 @@
 backtest.py
 ===========
 市場環境（地合い）とスコアリングを用いた精鋭選別バックテスト。
-2点刻みの詳細分析機能を搭載。
+5点刻みの詳細分析機能を搭載。
 """
 
 import os
@@ -88,8 +88,8 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
 
     df = pd.DataFrame(trades)
     
-    # 2点刻みでスコアをグルーピング
-    df['score_bin'] = (df['score'] // 2) * 2
+    # 5点刻みでスコアをグルーピング
+    df['score_bin'] = (df['score'] // 5) * 5
 
     score_stats = {}
     grouped = df.groupby('score_bin')
@@ -127,12 +127,12 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     }
 
 def _format_report_plain(summary: dict) -> str:
-    score_brief = "\n【スコア別詳細分析（2点刻み）】\n"
+    score_brief = "\n【スコア別詳細分析（5点刻み）】\n"
     score_brief += "------------------------------------------------------------\n"
     sorted_scores = sorted(summary.get('score_analysis', {}).items(), key=lambda x: x[0], reverse=True)
     
     for bin_val, v in sorted_scores:
-        label = f"{bin_val:2.0f}-{bin_val+1.9:4.1f}点"
+        label = f"{bin_val:2.0f}-{bin_val+4.9:4.1f}点"
         score_brief += f"{label}: {v['count']:>3}回 | 勝率{v['win_rate']:>5}% | 平均{v['avg_return']:>+6.2f}% | PF:{v['pf']:>4.2f}\n"
     
     return (
@@ -148,7 +148,7 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
     if not api_key: return _format_report_plain(summary)
     
     client = genai.Client(api_key=api_key)
-    prompt = f"日本株バックテスト結果です。2点刻みのスコア分析から、どのスコア帯が最も効率的か、改善案を要約して。\n\n結果:\n{summary}\n\n上位:\n{top_trades[:3]}"
+    prompt = f"日本株バックテスト結果です。5点刻みのスコア分析から、どのスコア帯が最も効率的か、改善案を要約して。\n\n結果:\n{summary}\n\n上位:\n{top_trades[:3]}"
     try:
         response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return response.text.strip()
@@ -185,10 +185,8 @@ def run_backtest_and_report():
             entry_date = df_ticker.iloc[i + 1]["date"]
             if entry_date in crash_dates: continue
 
-            # シグナル判定（内部で指標計算が行われ、hits[0]に全指標が格納される）
             hits = _check_signals(ticker, df_ticker.iloc[:i+1], cfg)
             if hits:
-                # signal_engineで付与された全指標（mavg_25_diffなど）をSeriesとしてスコア計算へ
                 score = calculate_score(pd.Series(hits[0]), cfg.get('scoring_logic', {}))
                 all_signals.append({
                     "date": pd.to_datetime(entry_date), 
@@ -203,7 +201,6 @@ def run_backtest_and_report():
         print("シグナルが検出されませんでした。"); return
 
     sig_df = pd.DataFrame(all_signals)
-    # 日ごとにスコアが高い順に選別
     selected = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
 
     final_trades, free_dates = [], {} 
