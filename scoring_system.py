@@ -1,73 +1,103 @@
 """
 scoring_system.py
 =================
-シグナル検知された銘柄に対し、線形補間（リニア）方式でスコアリングを行う。
-固定値加点ではなく「度合い」を数値化することで、銘柄間の微細な勢いの差を可視化する。
+YAML設定に基づき、銘柄の期待値を数値化する。
+1. 出来高の勢い
+2. 移動平均線への近さ（乖離率）
+3. RSIの立ち上がり
+4. 売買代金（流動性）
+これらの要素を総合して 0〜100点 で評価する。
 """
 
 import pandas as pd
 
-def _linear_scale(val, min_val, max_val, score_range):
-    """値を特定のスコア範囲に線形マッピングする補助関数"""
+def _linear_scale(val, min_val, max_val, score_max):
+    """値を 0 〜 score_max の範囲に線形マッピングする補助関数"""
+    if max_val <= min_val: return 0.0
     ratio = (val - min_val) / (max_val - min_val)
-    return max(min(score_range), min(max(score_range), ratio * (max(score_range) - min(score_range)) + min(score_range)))
+    return max(0.0, min(float(score_max), ratio * score_max))
 
 def calculate_score(row: pd.Series, scoring_cfg: dict = None) -> float:
-    # デフォルト設定（configから取得できない場合のバックアップ）
-    cfg = scoring_cfg or {}
-    
-    # 1. 基礎点
-    score = 40.0
+    """
+    configの scoring_logic パラメータを使用してスコアを算出する。
+    """
+    # 設定の読み込み（未指定時はデフォルト値を使用）
+    cfg = scoring_cfg if scoring_cfg else {}
+    weights = cfg.get('weights', {
+        'volume_surge': 40,
+        'bias_proximity': 30,
+        'rsi_position': 20,
+        'liquidity_scale': 10
+    })
+    params = cfg.get('parameters', {
+        'volume_max_multiplier': 5.0,
+        'bias_limit_pct': 10.0,
+        'turnover_ideal_min': 1000000000,
+        'rsi_ideal_range': [40, 65]
+    })
 
-    # 2. 中期トレンド評価 (最大 +20 / 最小 -10)
-    if row.get('is_above_ma25', False):
-        score += 10.0
-        if row.get('ma25_upward', False):
-            score += 10.0
-    else:
-        score -= 10.0
+    total_score = 0.0
 
-    # 3. 出来高の爆発力評価 (最大 +30 / 最小 -10)
-    # 0.5倍(-10点) ～ 3.0倍(+30点) で線形割り振振
+    # --- 1. 出来高スコア (最大 40点) ---
+    # 出来高比 1.0(0点) 〜 5.0(満点) で計算
     v_ratio = row.get('volume_ratio', 1.0)
-    vol_score = _linear_scale(v_ratio, 0.5, 3.0, (-10.0, 30.0))
-    score += vol_score
+    total_score += _linear_scale(v_ratio, 1.0, params['volume_max_multiplier'], weights['volume_surge'])
 
-    # 4. エントリー位置（乖離率）の評価 (最大 +10 / 最小 -20)
-    # 5日線乖離率(diff5)が「2.0%」を頂点とする山なり評価
-    diff5 = row.get('mavg_5_diff', 0.0)
-    if diff5 > 8.0:
-        score -= 20.0
-    else:
-        dist_from_ideal = abs(diff5 - 2.0)
-        entry_bonus = 10.0 - (dist_from_ideal * 4.0) 
-        score += max(-10.0, entry_bonus)
+    # --- 2. 25日線乖離率スコア (最大 30点) ---
+    # 25日線に近いほど加点（離れすぎると減点）
+    # 乖離 0%(満点) 〜 bias_limit_pct(0点)
+    bias = abs(row.get('mavg_25_diff', 0.0)) # 25日乖離率（絶対値）
+    bias_score = weights['bias_proximity'] - _linear_scale(bias, 0.0, params['bias_limit_pct'], weights['bias_proximity'])
+    total_score += max(0.0, bias_score)
 
-    # 5. RSIの「勢いと余白」評価 (最大 +10 / 最小 -20)
+    # --- 3. RSI位置スコア (最大 20点) ---
+    # 指定された理想範囲 (40〜65) に入っていれば満点、外れていれば0点
     rsi = row.get('rsi_14', 50.0)
-    if rsi > 75.0:
-        score -= 20.0
-    elif rsi < 30.0:
-        score -= 10.0
-    elif 40.0 <= rsi <= 65.0:
-        # 40(0点) ～ 65(10点) の間で加点
-        score += _linear_scale(rsi, 40.0, 65.0, (0.0, 10.0))
+    r_min, r_max = params['rsi_ideal_range']
+    if r_min <= rsi <= r_max:
+        total_score += weights['rsi_position']
 
-    # 最終スコアを 0.0 ～ 100.0 に収める
-    return float(round(max(0.0, min(100.0, score)), 2))
+    # --- 4. 流動性スコア (最大 10点) ---
+    # 売買代金（価格 × 出来高）が turnover_ideal_min (10億円) で満点
+    turnover = float(row.get('price', 0)) * float(row.get('volume', 0))
+    total_score += _linear_scale(turnover, 0, params['turnover_ideal_min'], weights['liquidity_scale'])
+
+    return float(round(total_score, 2))
 
 if __name__ == "__main__":
-    # 比較テスト
+    # モックデータによるテスト
+    test_cfg = {
+        'weights': {'volume_surge': 40, 'bias_proximity': 30, 'rsi_position': 20, 'liquidity_scale': 10},
+        'parameters': {
+            'volume_max_multiplier': 5.0,
+            'bias_limit_pct': 10.0,
+            'turnover_ideal_min': 1000000000,
+            'rsi_ideal_range': [40, 65]
+        }
+    }
+
     test_cases = [
-        {'name': '勢い弱め', 'is_above_ma25': True,  'volume_ratio': 1.2, 'mavg_5_diff': 0.5, 'rsi_14': 42.0},
-        {'name': '理想的',   'is_above_ma25': True,  'ma25_upward': True, 'volume_ratio': 2.8, 'mavg_5_diff': 2.1, 'rsi_14': 60.0},
-        {'name': '過熱気味', 'is_above_ma25': True,  'volume_ratio': 4.5, 'mavg_5_diff': 9.2, 'rsi_14': 80.0},
-        {'name': '底這い',   'is_above_ma25': False, 'volume_ratio': 0.6, 'mavg_5_diff': -1.0, 'rsi_14': 32.0},
+        {
+            'name': '理想的な初動',
+            'volume_ratio': 3.5,
+            'mavg_25_diff': 1.5,
+            'rsi_14': 55.0,
+            'price': 2000,
+            'volume': 600000  # 代金12億
+        },
+        {
+            'name': '過熱・乖離大',
+            'volume_ratio': 1.2,
+            'mavg_25_diff': 12.0,
+            'rsi_14': 80.0,
+            'price': 5000,
+            'volume': 100000  # 代金5億
+        }
     ]
-    
-    print(f"{'ケース':<8} | {'スコア':<6}")
-    print("-" * 20)
+
+    print(f"{'ケース':<12} | {'総合スコア':<6}")
+    print("-" * 25)
     for case in test_cases:
         s = pd.Series(case)
-        val = calculate_score(s)
-        print(f"{case['name']:<8} | {val:>5.2f}点")
+        score = calculate_score(s, test_cfg)
+        print(f"{case['name']:<12} | {score:>6.2f}点")
