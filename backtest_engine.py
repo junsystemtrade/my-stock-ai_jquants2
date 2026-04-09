@@ -2,13 +2,14 @@
 backtest.py
 ===========
 市場環境（地合い）とスコアリングを用いた精鋭選別バックテスト。
+2点刻みの詳細分析機能を搭載。
 """
 
 import os
 import requests
 import pandas as pd
 from google import genai
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import portfolio_manager
 from database_manager import DBManager
@@ -19,10 +20,10 @@ from scoring_system import calculate_score
 # バックテストパラメータ
 # -----------------------------------------------------------------------
 _DEFAULT_BT_PARAMS = {
-    "hold_days":         10,
+    "hold_days":          10,
     "stop_loss_pct":      5.0,
-    "initial_capital":   1_000_000,
-    "position_size":     0.1,
+    "initial_capital":    1_000_000,
+    "position_size":      0.1,
     "max_daily_entries": 3, 
     "market_crash_limit": -2.0  # 日経先物が前日比-2%以下ならエントリー見送り
 }
@@ -42,13 +43,11 @@ def _execute_trade(sig: dict, bt_params: dict) -> dict:
     stop_loss = bt_params["stop_loss_pct"] / 100
     
     entry_row = df.iloc[idx]
-    # エントリーは翌朝の始値を優先
     entry_price = float(entry_row["open"]) if pd.notna(entry_row.get("open")) and entry_row["open"] > 0 else float(entry_row["price"])
     if entry_price <= 0: return None
 
     exit_price, exit_date, exit_reason = None, None, "期間満了"
 
-    # 損切り判定
     for j in range(idx + 1, min(idx + 1 + hold_days, len(df))):
         curr_row = df.iloc[j]
         low_price = float(curr_row["low"]) if pd.notna(curr_row.get("low")) else float(curr_row["price"])
@@ -59,7 +58,6 @@ def _execute_trade(sig: dict, bt_params: dict) -> dict:
             exit_reason = "ストップロス"
             break
 
-    # 決済（損切りがなければ期間満了）
     if exit_price is None:
         exit_idx = min(idx + hold_days, len(df) - 1)
         exit_row = df.iloc[exit_idx]
@@ -90,18 +88,24 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
 
     df = pd.DataFrame(trades)
     
-    def categorize_score(s):
-        ranges = [(80, "80点以上"), (70, "70点台"), (60, "60点台"), (50, "50点台"), (40, "40点台"), (30, "30点台")]
-        for limit, label in ranges:
-            if s >= limit: return label
-        return "30点未満"
+    # 【核心】2点刻みでスコアをグルーピング
+    df['score_bin'] = (df['score'] // 2) * 2
 
-    df['score_range'] = df['score'].apply(categorize_score)
-    score_stats = {label: {
-        'count': len(group),
-        'win_rate': round((group['pnl_pct'] > 0).mean() * 100, 1),
-        'avg_return': round(group['pnl_pct'].mean(), 2)
-    } for label, group in df.groupby('score_range') if not group.empty}
+    score_stats = {}
+    grouped = df.groupby('score_bin')
+    for bin_val, group in grouped:
+        wins = group[group['pnl_pct'] > 0]
+        losses = group[group['pnl_pct'] <= 0]
+        
+        gross_profit = wins['pnl_yen'].sum()
+        gross_loss = abs(losses['pnl_yen'].sum()) or 1e-9
+        
+        score_stats[bin_val] = {
+            'count': len(group),
+            'win_rate': round(len(wins) / len(group) * 100, 1),
+            'avg_return': round(group['pnl_pct'].mean(), 2),
+            'pf': round(gross_profit / gross_loss, 2)
+        }
 
     wins = df[df["pnl_pct"] > 0]
     losses = df[df["pnl_pct"] <= 0]
@@ -123,9 +127,14 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     }
 
 def _format_report_plain(summary: dict) -> str:
-    score_brief = "\n【スコア別分析】\n"
-    for k, v in sorted(summary.get('score_analysis', {}).items(), reverse=True):
-        score_brief += f"{k}: {v['count']}回 | 勝率{v['win_rate']}% | 平均{v['avg_return']:+.2f}%\n"
+    # 2点刻みで内訳を表示するフォーマット
+    score_brief = "\n【スコア別詳細分析（2点刻み）】\n"
+    score_brief += "------------------------------------------------------------\n"
+    sorted_scores = sorted(summary.get('score_analysis', {}).items(), key=lambda x: x[0], reverse=True)
+    
+    for bin_val, v in sorted_scores:
+        label = f"{bin_val:2.0f}-{bin_val+1.9:4.1f}点"
+        score_brief += f"{label}: {v['count']:>3}回 | 勝率{v['win_rate']:>5}% | 平均{v['avg_return']:>+6.2f}% | PF:{v['pf']:>4.2f}\n"
     
     return (
         f"📊 **バックテスト結果(精鋭モード)**\n"
@@ -140,7 +149,7 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
     if not api_key: return _format_report_plain(summary)
     
     client = genai.Client(api_key=api_key)
-    prompt = f"日本株バックテスト結果です。地合いフィルターとスコアリングを用いた戦略について分析し、改善案をDiscord用に短く要約して。\n\n結果:\n{summary}\n\n上位:\n{top_trades[:3]}"
+    prompt = f"日本株バックテスト結果です。2点刻みのスコア分析から、どのスコア帯が最も効率的か、改善案を要約して。\n\n結果:\n{summary}\n\n上位:\n{top_trades[:3]}"
     try:
         response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return response.text.strip()
@@ -161,7 +170,6 @@ def run_backtest_and_report():
     df_all = db.load_analysis_data(days=365 * 3)
     if df_all.empty: return
 
-    # 市場地合い(NIY=F)の暴落日をセット(高速検索用)で保持
     niy_df = df_all[df_all["ticker"] == "NIY=F"].sort_values("date").copy()
     niy_df["m_change"] = niy_df["price"].pct_change() * 100
     crash_dates = set(niy_df[niy_df["m_change"] <= bt_params["market_crash_limit"]]["date"])
@@ -180,7 +188,6 @@ def run_backtest_and_report():
 
             hits = _check_signals(ticker, df_ticker.iloc[:i+1], cfg)
             if hits:
-                # シグナル発生時の足(i)でスコア判定
                 score = calculate_score(df_ticker.iloc[i], cfg.get('scoring_logic', {}))
                 all_signals.append({
                     "date": pd.to_datetime(entry_date), "ticker": ticker, "score": score,
@@ -190,7 +197,6 @@ def run_backtest_and_report():
     if not all_signals:
         print("シグナルが検出されませんでした。"); return
 
-    # 日ごとにスコア上位を厳選
     sig_df = pd.DataFrame(all_signals)
     selected = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
 
@@ -205,7 +211,6 @@ def run_backtest_and_report():
             final_trades.append(trade)
             free_dates[ticker] = trade["exit_date"]
 
-    # レポート処理
     if final_trades:
         summary = _calc_summary(final_trades, bt_params)
         report = _format_report_with_gemini(summary, sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True))
