@@ -35,7 +35,7 @@ def _to_yf_ticker(code):
 # 銘柄マスター取得
 # -----------------------------------------------------------------------
 def get_target_tickers():
-    """JPXから最新の銘柄リストを取得。失敗時はサンプルを返す。"""
+    """JPXから最新の銘柄リストを取得。"""
     base_url = "https://www.jpx.co.jp"
     list_page = f"{base_url}/markets/statistics-equities/misc/01.html"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -86,7 +86,6 @@ def _yf_fetch_chunk(tickers, start, end):
         return pd.DataFrame()
 
     all_dfs = []
-    # yfinanceの戻り値が単一銘柄か複数銘柄かで処理を分岐
     fetched_tickers = tickers if len(tickers) == 1 else raw.columns.levels[0]
 
     for t in fetched_tickers:
@@ -100,7 +99,6 @@ def _yf_fetch_chunk(tickers, start, end):
             df_t["price"] = df_t["Close"]
             df_t = df_t.rename(columns={"Open": "open", "High": "high", "Low": "low", "Volume": "volume"})
             
-            # 必要なカラムに絞り込み、欠損値を処理
             valid_df = df_t[["ticker", "date", "open", "high", "low", "price", "volume"]].dropna(subset=["price"])
             if not valid_df.empty:
                 all_dfs.append(valid_df)
@@ -119,32 +117,49 @@ def _prev_business_day(d):
     return d
 
 def sync_data():
-    """日次の差分更新"""
+    """
+    日次の差分更新：
+    バックフィル進捗に関わらず、直近7日分のデータを取得し、
+    NIY=FおよびDBに存在する銘柄を最新に保つ。
+    """
     db = database_manager.DBManager()
     target_end = _prev_business_day(_today_jst())
     
-    latest_date_str = db.get_latest_saved_date()
-    if not latest_date_str:
-        print("⚠️ DBにデータがありません。backfillを先に実行してください。")
-        return
+    # 銘柄リスト準備
+    target_stock_map = get_target_tickers()
+    all_tickers = list(target_stock_map.keys())
+    if MARKET_TICKER not in all_tickers:
+        all_tickers.append(MARKET_TICKER)
 
-    start_date = date.fromisoformat(latest_date_str) + timedelta(days=1)
-    if start_date > target_end:
-        print(f"✅ DBは最新です (最新日: {latest_date_str})。スキップします。")
-        return
-
-    # 銘柄リスト準備（市場地合いを必ず含める）
-    tickers = list(get_target_tickers().keys())
-    if MARKET_TICKER not in tickers:
-        tickers.append(MARKET_TICKER)
-
-    print(f"🔄 同期開始: {start_date} -> {target_end}")
-    df = _yf_fetch_chunk(tickers, start_date.strftime("%Y-%m-%d"), 
-                         (target_end + timedelta(days=1)).strftime("%Y-%m-%d"))
+    # 4,000銘柄を一括リクエストすると重いため、
+    # 「すでにDBにある銘柄」+「NIY=F」に絞り込む
+    from sqlalchemy import text
+    try:
+        with db.engine.connect() as conn:
+            existing = {row[0] for row in conn.execute(text("SELECT ticker FROM daily_prices GROUP BY ticker"))}
+    except:
+        existing = set()
     
-    if not df.empty:
-        db.save_prices(df)
-        print(f"✨ 同期完了: {len(df)} 件のデータを保存")
+    # NIY=F はDBになくても必ず取得対象にする
+    sync_targets = [t for t in all_tickers if t in existing or t == MARKET_TICKER]
+
+    print(f"🔄 同期開始 (ターゲット日: {target_end})")
+    print(f"📦 対象銘柄数: {len(sync_targets)}")
+
+    # 直近7日分をガバッと取って「重複スキップ(DB側)」に任せる
+    start_date = target_end - timedelta(days=7)
+    
+    # 銘柄数が多い可能性があるため、同期も念のためチャンク分割(100銘柄ずつ)
+    chunk_size = 100
+    for i in range(0, len(sync_targets), chunk_size):
+        chunk = sync_targets[i : i + chunk_size]
+        df = _yf_fetch_chunk(chunk, start_date.strftime("%Y-%m-%d"), 
+                             (target_end + timedelta(days=1)).strftime("%Y-%m-%d"))
+        
+        if not df.empty:
+            db.save_prices(df)
+            
+    print(f"✨ 同期処理が終了しました（NIY=F含む）")
 
 def backfill_data():
     """過去数年分のデータを一括取得（初回用）"""
@@ -157,7 +172,6 @@ def backfill_data():
     if MARKET_TICKER not in tickers:
         tickers.append(MARKET_TICKER)
 
-    # すでにDBにある銘柄を除外
     from sqlalchemy import text
     try:
         with db.engine.connect() as conn:
@@ -166,6 +180,11 @@ def backfill_data():
         existing = set()
 
     remaining = [t for t in tickers if t not in existing]
+    
+    if not remaining:
+        print("✅ 全銘柄のバックフィルが完了しています。")
+        return
+
     print(f"🚀 バックフィル開始: 残り {len(remaining)} 銘柄")
 
     chunk_size = 50
@@ -182,4 +201,24 @@ def backfill_data():
     print(f"\n✨ 全バックフィル工程が正常に終了しました。")
 
 if __name__ == "__main__":
-    backfill_data()
+    # DBの状態を確認し、適切なモードで実行
+    db = database_manager.DBManager()
+    
+    # NIY=Fがあるか、もしくはデータが一定数あるかで判定
+    # ※NIY=Fがまだない場合も、まずはバックフィルを優先して進める
+    from sqlalchemy import text
+    has_data = False
+    try:
+        with db.engine.connect() as conn:
+            res = conn.execute(text("SELECT COUNT(*) FROM daily_prices")).fetchone()
+            if res and res[0] > 0:
+                has_data = True
+    except:
+        pass
+
+    if has_data:
+        # デイリースキャン前などは sync_data で最新化
+        sync_data()
+    else:
+        # 初回実行時はバックフィル
+        backfill_data()
