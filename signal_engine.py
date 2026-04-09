@@ -20,16 +20,18 @@ def _load_config() -> dict:
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, encoding="utf-8") as f:
             return yaml.safe_load(f)
+    # デフォルト設定（バックテストと Claude 指標を反映）
     return {
         "signals": {
-            "golden_cross": {"enabled": True, "short_window": 25, "long_window": 75},
-            "rsi_oversold":  {"enabled": True, "window": 14, "threshold": 30},
+            "golden_cross": {"enabled": True, "short_window": 5, "long_window": 25},
+            "rsi_oversold":  {"enabled": True, "window": 14, "threshold": 50}, # 中立以下
             "volume_surge":  {"enabled": True, "window": 20, "multiplier": 2.0},
         },
         "filter": {
             "min_price": 500,
             "max_price": 50000,
-            "min_data_days": 80,
+            "min_data_days": 150, # 指標③：150日に延長
+            "min_daily_turnover_avg_20": 500000000, # 指標①：5億円
             "exclude_code_range": [[1000, 1999]],
             "max_signals_per_ticker": 1,
         },
@@ -52,7 +54,7 @@ def _get_market_condition() -> tuple[float, str]:
             df_niy = pd.read_sql(query, conn)
         
         if len(df_niy) < 2:
-            return 0.0, "不明"
+            return 0.0, "不明" # 指標②：バックフィル未完了時は「不明」
 
         p_now, p_prev = float(df_niy['price'].iloc[0]), float(df_niy['price'].iloc[1])
         m_change = (p_now - p_prev) / p_prev * 100
@@ -73,9 +75,10 @@ def _get_market_condition() -> tuple[float, str]:
 def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     close = df["price"].astype(float)
+    volume = df["volume"].astype(float)
     
     # 出来高比（5日平均に対して）
-    df['volume_ratio'] = df["volume"] / df["volume"].rolling(window=5).mean().shift(1)
+    df['volume_ratio'] = volume / volume.rolling(window=5).mean().shift(1)
     
     # 25日線乖離率（スコア計算の要）
     ma25 = close.rolling(window=25).mean()
@@ -84,6 +87,10 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 5日線乖離率
     ma5 = close.rolling(window=5).mean()
     df['mavg_5_diff'] = (close - ma5) / ma5 * 100
+
+    # 売買代金（ターンオーバー）の20日平均 - 指標①
+    df['turnover'] = close * volume
+    df['turnover_avg_20'] = df['turnover'].rolling(window=20).mean()
 
     # トレンド判定
     df['is_above_ma25'] = close > ma25
@@ -106,24 +113,31 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     if any(r[0] <= int(code_str) <= r[1] for r in cfg["filter"].get("exclude_code_range", []) if code_str.isdigit()):
         return []
 
-    # 指標計算と基本フィルタ
+    # 指標計算
     df = _calculate_indicators(df)
-    if len(df) < cfg["filter"].get("min_data_days", 80): return []
+    
+    # 指標③：十分な計算期間を確保（150日）
+    min_days = cfg["filter"].get("min_data_days", 150)
+    if len(df) < min_days: return []
     
     row = df.iloc[-1]
     price = float(row["price"])
+    
+    # フィルタ判定（価格帯 ＋ 指標① 売買代金）
+    min_turnover = cfg["filter"].get("min_daily_turnover_avg_20", 500000000)
+    if row["turnover_avg_20"] < min_turnover: return []
     if not (cfg["filter"]["min_price"] <= price <= cfg["filter"]["max_price"]): return []
 
     res = []
-    # ① ゴールデンクロス (25/75)
-    sma_s = df["price"].rolling(window=25).mean()
-    sma_l = df["price"].rolling(window=75).mean()
+    # ① ゴールデンクロス (短期 5/25) - 指標⑤
+    sma_s = df["price"].rolling(window=5).mean()
+    sma_l = df["price"].rolling(window=25).mean()
     if len(sma_s) > 1 and sma_s.iloc[-2] <= sma_l.iloc[-2] and sma_s.iloc[-1] > sma_l.iloc[-1]:
-        res.append({"signal_type": "ゴールデンクロス", "reason": "短期MA(25)が長期MA(75)を上抜け", "priority": 1})
+        res.append({"signal_type": "ゴールデンクロス(短期)", "reason": "5日線が25日線を上抜け", "priority": 1})
 
-    # ② RSI売られすぎ
+    # ② RSI中立以下 (名称変更) - 指標⑥
     if row["rsi_14"] < cfg["signals"]["rsi_oversold"]["threshold"]:
-        res.append({"signal_type": "RSI売られすぎ", "reason": f"RSI: {row['rsi_14']:.1f}", "priority": 2})
+        res.append({"signal_type": "RSI中立以下", "reason": f"RSI: {row['rsi_14']:.1f}", "priority": 2})
 
     # ③ 出来高急増
     if row["volume_ratio"] >= cfg["signals"]["volume_surge"]["multiplier"]:
@@ -136,7 +150,7 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     best_signal.update({
         "ticker": ticker, 
         "price": price, 
-        **row.to_dict() # スコア計算に必要な全指標を統合
+        **row.to_dict() # スコア計算に必要な全指標（乖離率等）を統合
     })
     return [best_signal]
 
