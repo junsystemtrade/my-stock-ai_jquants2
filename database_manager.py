@@ -8,8 +8,8 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 
+# 一度に INSERT する行数。タイムアウト対策のため環境変数で調整可能にする
 _DB_CHUNK_SIZE = int(os.getenv("DB_CHUNK_SIZE", "1000"))
-
 
 
 class DBManager:
@@ -17,12 +17,14 @@ class DBManager:
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
             raise RuntimeError("DATABASE_URL が設定されていません")
+        
         self.engine = create_engine(
             db_url,
             pool_pre_ping=True,
             pool_recycle=1800,
             connect_args={
                 "connect_timeout": 30,
+                # 基本はタイムアウトなしにするが、DDL実行時などは個別に設定
                 "options": "-c statement_timeout=0"
             },
         )
@@ -42,10 +44,8 @@ class DBManager:
                 exists = conn.execute(check_query).scalar()
             
             if exists:
-                # テーブルが既に存在すれば、重い CREATE 文は一切発行せずに終了
                 return
 
-            # テーブルがない場合のみ、重い処理を実行
             ddl = """
             CREATE TABLE IF NOT EXISTS daily_prices (
                 ticker  TEXT        NOT NULL,
@@ -61,7 +61,8 @@ class DBManager:
             CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker ON daily_prices (ticker);
             """
             with self.engine.begin() as conn:
-                conn.execute(text("SET statement_timeout = '120s'")) # 念のため120秒
+                # テーブル作成時は長めのタイムアウトを許容
+                conn.execute(text("SET statement_timeout = '120s'"))
                 conn.execute(text(ddl))
                 print("✅ データベーステーブルを新規作成しました")
 
@@ -69,13 +70,16 @@ class DBManager:
             print(f"⚠️ テーブル確認中にエラー（無視して続行）: {e}")
 
     def save_prices(self, df: pd.DataFrame):
-        """重複はスキップしつつ chunksize 行ずつ分割 INSERT。"""
+        """
+        タイムアウト対策を施した保存処理。
+        _DB_CHUNK_SIZE ごとにトランザクションを確定（コミット）させる。
+        """
         if df.empty:
             print("⚠️ 保存対象のデータが空です。スキップします。")
             return
 
         required = ["ticker", "date", "open", "high", "low", "price", "volume"]
-        rows     = df[required].to_dict(orient="records")
+        rows = df[required].to_dict(orient="records")
 
         insert_sql = text("""
             INSERT INTO daily_prices (ticker, date, open, high, low, price, volume)
@@ -85,18 +89,24 @@ class DBManager:
 
         total_inserted = 0
         try:
+            # 大量データを一気に INSERT するとインデックス更新でタイムアウトするため分割実行
             for i in range(0, len(rows), _DB_CHUNK_SIZE):
                 chunk = rows[i : i + _DB_CHUNK_SIZE]
+                # self.engine.begin() をループ内で使うことで、各チャンクごとに COMMIT される
                 with self.engine.begin() as conn:
+                    # 個別のチャンクに対してもステートメントタイムアウトを設定（安全策）
+                    conn.execute(text("SET statement_timeout = '60s'"))
                     conn.execute(insert_sql, chunk)
                 total_inserted += len(chunk)
-            print(f"✅ DB保存完了: {total_inserted:,} 件（重複はスキップ）")
+            
+            print(f"✅ DB保存完了: {len(df):,} 件（チャンク分割実行完了）")
+            
         except Exception as e:
             print(f"❌ DB保存エラー: {e}")
             raise
 
     def get_latest_saved_date(self) -> str | None:
-        """保存済みの最新日を返す。なければ None。"""
+        """保存済みの最新日を返す。"""
         query = text("SELECT MAX(date) AS max_date FROM daily_prices")
         with self.engine.connect() as conn:
             result = conn.execute(query).fetchone()
@@ -105,10 +115,7 @@ class DBManager:
         return None
 
     def get_oldest_saved_date(self) -> str | None:
-        """
-        保存済みの最古日を返す。なければ None。
-        バックフィルの続き再開に使う。
-        """
+        """保存済みの最古日を返す（バックフィルの再開用）。"""
         query = text("SELECT MIN(date) AS min_date FROM daily_prices")
         with self.engine.connect() as conn:
             result = conn.execute(query).fetchone()
