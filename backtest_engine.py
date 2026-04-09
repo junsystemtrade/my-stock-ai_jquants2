@@ -88,7 +88,7 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
 
     df = pd.DataFrame(trades)
     
-    # 【核心】2点刻みでスコアをグルーピング
+    # 2点刻みでスコアをグルーピング
     df['score_bin'] = (df['score'] // 2) * 2
 
     score_stats = {}
@@ -127,7 +127,6 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     }
 
 def _format_report_plain(summary: dict) -> str:
-    # 2点刻みで内訳を表示するフォーマット
     score_brief = "\n【スコア別詳細分析（2点刻み）】\n"
     score_brief += "------------------------------------------------------------\n"
     sorted_scores = sorted(summary.get('score_analysis', {}).items(), key=lambda x: x[0], reverse=True)
@@ -183,28 +182,28 @@ def run_backtest_and_report():
         if len(df_ticker) < min_days: continue
         
         for i in range(min_days, len(df_ticker) - 1):
-    entry_date = df_ticker.iloc[i + 1]["date"]
-    if entry_date in crash_dates: continue
+            entry_date = df_ticker.iloc[i + 1]["date"]
+            if entry_date in crash_dates: continue
 
-    # _check_signals は内部で _calculate_indicators を呼び、
-    # 指標を含んだ辞書（hits）を返すように設計されているため、これを利用する
-    hits = _check_signals(ticker, df_ticker.iloc[:i+1], cfg)
-    if hits:
-        # hits[0] には row.to_dict() によって全指標（mavg_25_diff等）が含まれている
-        score = calculate_score(pd.Series(hits[0]), cfg.get('scoring_logic', {}))
-        all_signals.append({
-            "date": pd.to_datetime(entry_date), 
-            "ticker": ticker, 
-            "score": score,
-            "signal_type": hits[0]["signal_type"], 
-            "df_ticker": df_ticker, 
-            "entry_idx": i + 1
-        })
+            # シグナル判定（内部で指標計算が行われ、hits[0]に全指標が格納される）
+            hits = _check_signals(ticker, df_ticker.iloc[:i+1], cfg)
+            if hits:
+                # signal_engineで付与された全指標（mavg_25_diffなど）をSeriesとしてスコア計算へ
+                score = calculate_score(pd.Series(hits[0]), cfg.get('scoring_logic', {}))
+                all_signals.append({
+                    "date": pd.to_datetime(entry_date), 
+                    "ticker": ticker, 
+                    "score": score,
+                    "signal_type": hits[0]["signal_type"], 
+                    "df_ticker": df_ticker, 
+                    "entry_idx": i + 1
+                })
 
     if not all_signals:
         print("シグナルが検出されませんでした。"); return
 
     sig_df = pd.DataFrame(all_signals)
+    # 日ごとにスコアが高い順に選別
     selected = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
 
     final_trades, free_dates = [], {} 
