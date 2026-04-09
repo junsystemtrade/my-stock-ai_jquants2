@@ -77,12 +77,15 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 出来高比（5日平均に対して）
     df['volume_ratio'] = df["volume"] / df["volume"].rolling(window=5).mean().shift(1)
     
+    # 25日線乖離率（スコア計算の要）
+    ma25 = close.rolling(window=25).mean()
+    df['mavg_25_diff'] = (close - ma25) / ma25 * 100
+
     # 5日線乖離率
     ma5 = close.rolling(window=5).mean()
     df['mavg_5_diff'] = (close - ma5) / ma5 * 100
 
-    # 25日トレンド
-    ma25 = close.rolling(window=25).mean()
+    # トレンド判定
     df['is_above_ma25'] = close > ma25
     df['ma25_upward'] = ma25.diff() > 0
 
