@@ -201,24 +201,36 @@ def backfill_data():
     print(f"\n✨ 全バックフィル工程が正常に終了しました。")
 
 if __name__ == "__main__":
-    # DBの状態を確認し、適切なモードで実行
     db = database_manager.DBManager()
     
-    # NIY=Fがあるか、もしくはデータが一定数あるかで判定
-    # ※NIY=Fがまだない場合も、まずはバックフィルを優先して進める
+    # 1. ターゲットとなる全銘柄リストを取得
+    target_stocks = get_target_tickers()
+    all_target_tickers = list(target_stocks.keys())
+    if MARKET_TICKER not in all_target_tickers:
+        all_target_tickers.append(MARKET_TICKER)
+
+    # 2. 現在DBに存在する銘柄の「種類」を取得
     from sqlalchemy import text
-    has_data = False
+    existing_tickers = set()
     try:
         with db.engine.connect() as conn:
-            res = conn.execute(text("SELECT COUNT(*) FROM daily_prices")).fetchone()
-            if res and res[0] > 0:
-                has_data = True
-    except:
-        pass
+            # 銘柄ごとの最新1件だけ見ればいいので、DISTINCT または GROUP BY で高速に取得
+            res = conn.execute(text("SELECT ticker FROM daily_prices GROUP BY ticker"))
+            existing_tickers = {row[0] for row in res}
+    except Exception as e:
+        print(f"⚠️ DB接続エラー: {e}")
 
-    if has_data:
-        # デイリースキャン前などは sync_data で最新化
-        sync_data()
-    else:
-        # 初回実行時はバックフィル
+    # 3. 未取得の銘柄があるか判定
+    # targetにはあるが、DBにはまだ1件もデータがない銘柄を抽出
+    remaining_tickers = [t for t in all_target_tickers if t not in existing_tickers]
+
+    print(f"📊 進捗確認: 全 {len(all_target_tickers)} 銘柄中、{len(existing_tickers)} 銘柄がDBに存在します。")
+
+    if len(remaining_tickers) > 0:
+        # 未完了の銘柄が1つでもあるならバックフィルモードを継続
+        print(f"📝 残り {len(remaining_tickers)} 銘柄のバックフィルを開始します...")
         backfill_data()
+    else:
+        # 全銘柄の「初回の過去分」が揃っていれば、日次同期モードに切り替え
+        print("✅ 全銘柄のバックフィルが完了しています。同期モード(sync_data)を実行します。")
+        sync_data()
