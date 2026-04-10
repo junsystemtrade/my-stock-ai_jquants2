@@ -16,22 +16,22 @@ import database_manager
 # -----------------------------------------------------------------------
 _CONFIG_PATH = Path(__file__).parent / "signals_config.yml"
 
+# signal_engine.py の _load_config() 内、デフォルト設定を修正
 def _load_config() -> dict:
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, encoding="utf-8") as f:
             return yaml.safe_load(f)
-    # デフォルト設定（バックテストと Claude 指標を反映）
     return {
         "signals": {
             "golden_cross": {"enabled": True, "short_window": 5, "long_window": 25},
-            "rsi_oversold":  {"enabled": True, "window": 14, "threshold": 50}, # 中立以下
+            "rsi_oversold":  {"enabled": True, "window": 14, "threshold": 50},
             "volume_surge":  {"enabled": True, "window": 20, "multiplier": 2.0},
         },
         "filter": {
             "min_price": 500,
             "max_price": 50000,
-            "min_data_days": 150, # 指標③：150日に延長
-            "min_daily_turnover_avg_20": 500000000, # 指標①：5億円
+            "min_data_days": 80,  # ← 150 から 80 に修正（YAMLと統一）
+            "min_daily_turnover_avg_20": 500000000,
             "exclude_code_range": [[1000, 1999]],
             "max_signals_per_ticker": 1,
         },
@@ -157,24 +157,28 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
 # -----------------------------------------------------------------------
 # メインスキャン
 # -----------------------------------------------------------------------
+# signal_engine.py の scan_signals() を修正
 def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[dict]:
-    """
-    全銘柄をスキャン。market_statusが渡されない場合は内部で取得。
-    """
     if daily_data.empty: return []
     cfg = _load_config()
-    
-    # 地合いの確定（注入されていなければ取得）
+
+    # 地合いの確定
+    market_change, market_status_actual = _get_market_condition()
     if market_status is None:
-        _, market_status = _get_market_condition()
+        market_status = market_status_actual
+
+    # ★ market_breaker チェック（ここを追加）
+    breaker_cfg = cfg.get("filter", {}).get("market_breaker", {})
+    if breaker_cfg.get("enabled", False):
+        threshold = breaker_cfg.get("drop_threshold_pct", -1.5)
+        if market_change <= threshold:
+            print(f"🚨 market_breaker 発動: 日経先物 {market_change:+.2f}% → 本日のスキャンをスキップします")
+            return []
 
     all_hits = []
-    # NIY=Fを除いた銘柄ごとに判定
     for ticker, df_ticker in daily_data[daily_data["ticker"] != "NIY=F"].groupby("ticker"):
-        # 日付順を保証
         df_sorted = df_ticker.sort_values("date")
         hits = _check_signals(ticker, df_sorted, cfg)
-        
         for h in hits:
             h["market_status"] = market_status
             all_hits.append(h)
