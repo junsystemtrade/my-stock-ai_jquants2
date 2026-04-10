@@ -24,7 +24,6 @@ class DBManager:
             pool_recycle=1800,
             connect_args={
                 "connect_timeout": 30,
-                # 基本はタイムアウトなしにするが、DDL実行時などは個別に設定
                 "options": "-c statement_timeout=0"
             },
         )
@@ -38,33 +37,56 @@ class DBManager:
                 WHERE table_name = 'daily_prices'
             );
         """)
-        
+        check_positions_query = text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'positions'
+            );
+        """)
+
         try:
             with self.engine.connect() as conn:
                 exists = conn.execute(check_query).scalar()
-            
-            if exists:
-                return
+                exists_positions = conn.execute(check_positions_query).scalar()
 
-            ddl = """
-            CREATE TABLE IF NOT EXISTS daily_prices (
-                ticker  TEXT        NOT NULL,
-                date    DATE        NOT NULL,
-                open    NUMERIC,
-                high    NUMERIC,
-                low     NUMERIC,
-                price   NUMERIC,
-                volume  BIGINT,
-                PRIMARY KEY (ticker, date)
-            );
-            CREATE INDEX IF NOT EXISTS idx_daily_prices_date   ON daily_prices (date);
-            CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker ON daily_prices (ticker);
-            """
-            with self.engine.begin() as conn:
-                # テーブル作成時は長めのタイムアウトを許容
-                conn.execute(text("SET statement_timeout = '120s'"))
-                conn.execute(text(ddl))
-                print("✅ データベーステーブルを新規作成しました")
+            if not exists:
+                ddl = """
+                CREATE TABLE IF NOT EXISTS daily_prices (
+                    ticker  TEXT        NOT NULL,
+                    date    DATE        NOT NULL,
+                    open    NUMERIC,
+                    high    NUMERIC,
+                    low     NUMERIC,
+                    price   NUMERIC,
+                    volume  BIGINT,
+                    PRIMARY KEY (ticker, date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_prices_date   ON daily_prices (date);
+                CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker ON daily_prices (ticker);
+                """
+                with self.engine.begin() as conn:
+                    conn.execute(text("SET statement_timeout = '120s'"))
+                    conn.execute(text(ddl))
+                    print("✅ daily_pricesテーブルを新規作成しました")
+
+            if not exists_positions:
+                ddl_positions = """
+                CREATE TABLE IF NOT EXISTS positions (
+                    ticker       TEXT    NOT NULL,
+                    entry_date   DATE    NOT NULL,
+                    entry_price  NUMERIC NOT NULL,
+                    signal_type  TEXT,
+                    status       TEXT    NOT NULL DEFAULT 'open',
+                    closed_date  DATE,
+                    close_reason TEXT,
+                    PRIMARY KEY (ticker, entry_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_positions_status ON positions (status);
+                """
+                with self.engine.begin() as conn:
+                    conn.execute(text("SET statement_timeout = '120s'"))
+                    conn.execute(text(ddl_positions))
+                    print("✅ positionsテーブルを新規作成しました")
 
         except Exception as e:
             print(f"⚠️ テーブル確認中にエラー（無視して続行）: {e}")
@@ -89,12 +111,9 @@ class DBManager:
 
         total_inserted = 0
         try:
-            # 大量データを一気に INSERT するとインデックス更新でタイムアウトするため分割実行
             for i in range(0, len(rows), _DB_CHUNK_SIZE):
                 chunk = rows[i : i + _DB_CHUNK_SIZE]
-                # self.engine.begin() をループ内で使うことで、各チャンクごとに COMMIT される
                 with self.engine.begin() as conn:
-                    # 個別のチャンクに対してもステートメントタイムアウトを設定（安全策）
                     conn.execute(text("SET statement_timeout = '60s'"))
                     conn.execute(insert_sql, chunk)
                 total_inserted += len(chunk)
@@ -104,6 +123,65 @@ class DBManager:
         except Exception as e:
             print(f"❌ DB保存エラー: {e}")
             raise
+
+    def save_position(self, ticker: str, entry_date, entry_price: float, signal_type: str):
+        """買いシグナル発生時にポジションを保存する。"""
+        sql = text("""
+            INSERT INTO positions (ticker, entry_date, entry_price, signal_type, status)
+            VALUES (:ticker, :entry_date, :entry_price, :signal_type, 'open')
+            ON CONFLICT (ticker, entry_date) DO NOTHING
+        """)
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(sql, {
+                    "ticker": ticker,
+                    "entry_date": entry_date,
+                    "entry_price": entry_price,
+                    "signal_type": signal_type,
+                })
+            print(f"✅ ポジション保存: {ticker} / {entry_date}")
+        except Exception as e:
+            print(f"❌ ポジション保存エラー: {e}")
+
+    def load_open_positions(self) -> pd.DataFrame:
+        """オープン中のポジションを全件取得する。"""
+        sql = text("""
+            SELECT ticker, entry_date, entry_price, signal_type
+            FROM positions
+            WHERE status = 'open'
+            ORDER BY entry_date ASC
+        """)
+        try:
+            with self.engine.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            print(f"📂 オープンポジション: {len(df)} 件")
+            return df
+        except Exception as e:
+            print(f"❌ ポジション読み込みエラー: {e}")
+            return pd.DataFrame()
+
+    def close_position(self, ticker: str, entry_date, close_reason: str, closed_date):
+        """ポジションをクローズする。"""
+        sql = text("""
+            UPDATE positions
+            SET status = 'closed',
+                close_reason = :close_reason,
+                closed_date  = :closed_date
+            WHERE ticker = :ticker
+              AND entry_date = :entry_date
+              AND status = 'open'
+        """)
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(sql, {
+                    "ticker": ticker,
+                    "entry_date": entry_date,
+                    "close_reason": close_reason,
+                    "closed_date": closed_date,
+                })
+            print(f"✅ ポジションクローズ: {ticker} / {close_reason}")
+        except Exception as e:
+            print(f"❌ ポジションクローズエラー: {e}")
 
     def get_latest_saved_date(self) -> str | None:
         """保存済みの最新日を返す。"""
