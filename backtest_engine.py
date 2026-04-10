@@ -155,9 +155,15 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
     except:
         return _format_report_plain(summary)
 
+# backtest_engine.py の _send_discord() を修正
 def _send_discord(content: str):
+    # ★ 修正：NOTIFY_DISCORD が "false" の場合はスキップ
+    if os.getenv("NOTIFY_DISCORD", "true").lower() == "false":
+        print("📭 Discord通知はスキップされました（NOTIFY_DISCORD=false）")
+        return
     url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-    if url: requests.post(url, json={"content": content[:1990]})
+    if url:
+        requests.post(url, json={"content": content[:1990]})
 
 # -----------------------------------------------------------------------
 # メイン実行
