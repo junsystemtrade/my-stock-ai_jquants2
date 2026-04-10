@@ -166,7 +166,6 @@ def check_exit_signals(daily_data: pd.DataFrame, hold_days: int = 10) -> list[di
         entry_date = pd.to_datetime(pos["entry_date"]).date()
         entry_price = float(pos["entry_price"])
 
-        # 該当銘柄のデータを取得
         df_ticker = daily_data[daily_data["ticker"] == ticker].sort_values("date")
         if df_ticker.empty or len(df_ticker) < 26:
             continue
@@ -181,10 +180,8 @@ def check_exit_signals(daily_data: pd.DataFrame, hold_days: int = 10) -> list[di
         # 条件1: テクニカル手じまい
         sma_s = df_ticker["sma_5"]
         sma_l = df_ticker["sma_25"]
-        # デッドクロス（5日線が25日線を下抜け）
         if len(sma_s) > 1 and sma_s.iloc[-2] >= sma_l.iloc[-2] and sma_s.iloc[-1] < sma_l.iloc[-1]:
             exit_reason = "💀 デッドクロス発生"
-        # RSI過熱
         elif row["rsi_14"] >= 70:
             exit_reason = f"🌡️ RSI過熱 ({row['rsi_14']:.1f})"
 
@@ -203,12 +200,13 @@ def check_exit_signals(daily_data: pd.DataFrame, hold_days: int = 10) -> list[di
                 "pnl_pct": round(pnl_pct, 2),
                 "exit_reason": exit_reason,
             })
-            # DBのポジションをクローズ
+            # ★ exit_price を追加
             db.close_position(
                 ticker=ticker,
                 entry_date=entry_date,
                 close_reason=exit_reason,
                 closed_date=today,
+                exit_price=current_price,
             )
 
     print(f"🚨 手じまいシグナル: {len(exit_signals)} 件")
