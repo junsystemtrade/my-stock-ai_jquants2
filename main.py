@@ -10,7 +10,8 @@ import sys
 import requests
 import pandas as pd
 import yfinance as yf
-import google.generativeai as genai
+# 新しい google-genai SDK をインポート
+from google import genai
 
 import portfolio_manager
 import signal_engine
@@ -19,14 +20,13 @@ from database_manager import DBManager
 from scoring_system import calculate_score
 from signal_engine import _load_config, _get_market_condition
 
-# --- Gemini API 設定 ---
+# --- Gemini API 設定 (google-genai 対応) ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    # エラー回避のため最新の安定モデル名を指定
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    # 新しい SDK のクライアント生成方法
+    client = genai.Client(api_key=GOOGLE_API_KEY)
 else:
-    gemini_model = None
+    client = None
 
 # -----------------------------------------------------------------------
 # 外部情報の取得 (Gemini & yfinance)
@@ -47,14 +47,18 @@ def get_company_info_and_topic(ticker: str, company_name: str):
     except Exception as e:
         print(f"⚠️ yfinance エラー ({ticker}): {e}")
 
-    # 2. Gemini で直近トピックを生成
-    if gemini_model:
+    # 2. Gemini で直近トピックを生成 (google-genai SDK 仕様)
+    if client:
         prompt = f"""
         日本の株式銘柄「{company_name} ({ticker})」について、ここ数日の重要ニュースやトピックを100文字程度で簡潔に要約してください。
         特にニュースがない場合は、その企業の現在の強みについて触れてください。
         """
         try:
-            response = gemini_model.generate_content(prompt)
+            # 新しい SDK では client.models.generate_content を使用
+            response = client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=prompt
+            )
             topic_comment = response.text.strip()
         except Exception as e:
             topic_comment = f"（Geminiエラー: {e}）"
@@ -78,7 +82,7 @@ def send_discord(content: str):
             print(f"❌ Discord 送信エラー: {res.status_code}")
 
 # -----------------------------------------------------------------------
-# メイン処理
+# メイン処理 (変更なし)
 # -----------------------------------------------------------------------
 def main():
     print("🚀 システム起動: 株式分析プロセスを開始します")
@@ -148,7 +152,7 @@ def main():
         send_discord(msg)
         sys.exit(1)
 
-    # 5. Discord 通知（理想の体裁へ修正）
+    # 5. Discord 通知
     print("\n--- STEP 5: Discord 通知 ---")
     report = "🏛️ **【株式シグナル検知：厳選TOP3】**\n"
     report += f"📊 判定地合い: **{market_status}**\n"
