@@ -1,13 +1,12 @@
 """
 main.py
 =======
-クォータ制限 (429) 対策として待機時間を導入。
-日本語での企業リサーチを安定化させたバージョン。
+クォータ対策を強化し、モデルを 1.5-flash に変更して安定化させたバージョン。
 """
 
 import os
 import sys
-import time  # 待機用
+import time
 import requests
 import pandas as pd
 from google import genai
@@ -25,55 +24,54 @@ client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
 def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
     """
-    クォータ制限を考慮しつつ、Gemini 2.0 Flash で日本語リサーチを行う。
+    リトライ機能を備えた企業リサーチ。
     """
     code = ticker.replace(".T", "")
-    name, summary, topic = code, "（調査中）", "（トピック取得エラー）"
+    name, summary, topic = code, "（調査中）", "（取得失敗）"
 
     if not client:
         return name, summary, "（APIキー未設定）"
 
     prompt = f"""
-あなたは日本の株式市場に精通したリサーチアナリストです。以下の銘柄を日本語でリサーチしてください。
-
-銘柄コード: {code}
-シグナル: {signal_type} ({reason})
-
-【出力形式】
+日本の銘柄「{code}」を日本語でリサーチし、以下の3行で出力せよ。
 1行目: 企業名
-2行目: 【事業概要】（30文字以内の日本語要約）
-3行目: 【最新トピック】（100文字以内のニュースや背景）
-
-※投資助言は行わず、事実のみを述べてください。日本語で出力してください。
+2行目: 【事業概要】主力事業と特徴（30字以内）
+3行目: 【最新トピック】直近のニュースや注目点（100字以内）
+※投資助言禁止。日本語必須。
 """
 
-    try:
-        # 1.5 Flash よりも 2.0 Flash の方が制限が厳しいため、エラー時は 1.5 へ切り替える工夫も可能ですが
-        # まずは 2.0 Flash でリトライ間隔を空けて対応します
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-        res_text = response.text.strip().split('\n')
-        
-        if len(res_text) >= 1:
-            name = res_text[0].strip().replace("**", "") # 装飾除去
-        
-        full_body = "\n".join(res_text[1:])
-        if "【最新トピック】" in full_body:
-            parts = full_body.split("【最新トピック】")
-            summary = parts[0].replace("【事業概要】", "").replace(":", "").strip()
-            topic = parts[1].replace(":", "").strip()
-        else:
-            topic = full_body[:150] # 形式が崩れた場合のバックアップ
+    # 最大3回までリトライ
+    for attempt in range(3):
+        try:
+            # 安定性の高い 1.5-flash を使用
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=prompt,
+            )
+            res_text = [line.strip() for line in response.text.strip().split('\n') if line.strip()]
+            
+            if len(res_text) >= 1:
+                name = res_text[0].replace("**", "")
+                
+                # 残りのテキストから概要とトピックを抽出
+                body = "\n".join(res_text[1:])
+                if "【最新トピック】" in body:
+                    parts = body.split("【最新トピック】")
+                    summary = parts[0].replace("【事業概要】", "").replace(":", "").strip()
+                    topic = parts[1].replace(":", "").strip()
+                else:
+                    topic = body[:150]
+                
+                return name, summary, topic # 成功したら抜ける
 
-    except Exception as e:
-        if "429" in str(e):
-            topic = "⚠️ Gemini APIの無料枠制限に達しました。しばらく時間を置いて再試行してください。"
-        else:
-            topic = f"（リサーチエラー: {e}）"
-
-    return name, summary, topic
+        except Exception as e:
+            print(f"⚠️ リサーチ試行 {attempt+1} 回目失敗: {e}")
+            if "429" in str(e):
+                time.sleep(10) # 429エラー時は長めに待機
+            else:
+                time.sleep(2)
+    
+    return name, "（制限により取得不可）", "⚠️ Gemini APIが混雑しています。時間を空けて実行してください。"
 
 def send_discord(content: str):
     url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -83,7 +81,7 @@ def send_discord(content: str):
         requests.post(url, json={"content": chunk})
 
 def main():
-    print("🚀 システム起動: 日本語リサーチ & クォータ対策モード")
+    print("🚀 システム起動: 安定リサーチモード")
     cfg = _load_config()
 
     portfolio_manager.sync_data()
@@ -94,13 +92,13 @@ def main():
     market_change, market_status = _get_market_condition()
     raw_signals = signal_engine.scan_signals(daily_data, market_status=market_status)
     if not raw_signals:
-        send_discord(f"📊 地合い: {market_status}\n✅ 本日のスキャン完了：対象なし")
+        send_discord(f"📊 地合い: {market_status}\n✅ 対象なし")
         return
 
+    # スコアリング
     scoring_cfg = cfg.get('scoring_logic', {})
     for s in raw_signals:
         s["score"] = calculate_score(pd.Series(s), scoring_cfg)
-    
     signals = sorted(raw_signals, key=lambda x: x.get("score", 0), reverse=True)[:3]
 
     report = "🏛️ **【株式シグナル検知：厳選TOP3】**\n"
@@ -108,9 +106,8 @@ def main():
     report += "━" * 20 + "\n"
 
     for i, s in enumerate(signals, 1):
-        # 銘柄ごとのリクエストの間に 2秒 の待機時間を設ける（429対策）
         if i > 1:
-            time.sleep(2)
+            time.sleep(5) # 銘柄間も長めに待機
             
         name, business, topic = get_detailed_research(s['ticker'], s['signal_type'], s['reason'])
 
@@ -125,7 +122,7 @@ def main():
         )
 
     send_discord(report)
-    print("✅ レポート送信完了")
+    print("✅ 送信完了")
 
 if __name__ == "__main__":
     main()
