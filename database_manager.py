@@ -79,6 +79,7 @@ class DBManager:
                     status       TEXT    NOT NULL DEFAULT 'open',
                     closed_date  DATE,
                     close_reason TEXT,
+                    exit_price   NUMERIC,
                     PRIMARY KEY (ticker, entry_date)
                 );
                 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions (status);
@@ -87,6 +88,13 @@ class DBManager:
                     conn.execute(text("SET statement_timeout = '120s'"))
                     conn.execute(text(ddl_positions))
                     print("✅ positionsテーブルを新規作成しました")
+            else:
+                # 既存テーブルに exit_price カラムがなければ追加（マイグレーション）
+                with self.engine.begin() as conn:
+                    conn.execute(text("""
+                        ALTER TABLE positions
+                        ADD COLUMN IF NOT EXISTS exit_price NUMERIC;
+                    """))
 
         except Exception as e:
             print(f"⚠️ テーブル確認中にエラー（無視して続行）: {e}")
@@ -160,28 +168,70 @@ class DBManager:
             print(f"❌ ポジション読み込みエラー: {e}")
             return pd.DataFrame()
 
-    def close_position(self, ticker: str, entry_date, close_reason: str, closed_date):
-        """ポジションをクローズする。"""
+    def close_position(self, ticker: str, entry_date, close_reason: str, closed_date, exit_price: float):
+        """ポジションをクローズする。exit_price を記録する。"""
         sql = text("""
             UPDATE positions
-            SET status = 'closed',
+            SET status       = 'closed',
                 close_reason = :close_reason,
-                closed_date  = :closed_date
-            WHERE ticker = :ticker
+                closed_date  = :closed_date,
+                exit_price   = :exit_price
+            WHERE ticker     = :ticker
               AND entry_date = :entry_date
-              AND status = 'open'
+              AND status     = 'open'
         """)
         try:
             with self.engine.begin() as conn:
                 conn.execute(sql, {
-                    "ticker": ticker,
-                    "entry_date": entry_date,
+                    "ticker":       ticker,
+                    "entry_date":   entry_date,
                     "close_reason": close_reason,
-                    "closed_date": closed_date,
+                    "closed_date":  closed_date,
+                    "exit_price":   exit_price,
                 })
-            print(f"✅ ポジションクローズ: {ticker} / {close_reason}")
+            print(f"✅ ポジションクローズ: {ticker} / {close_reason} / 売値:{exit_price}円")
         except Exception as e:
             print(f"❌ ポジションクローズエラー: {e}")
+
+    def load_weekly_trades(self) -> pd.DataFrame:
+        """直近7日間にクローズしたトレードを取得する。"""
+        sql = text("""
+            SELECT
+                ticker, entry_date, entry_price,
+                closed_date, exit_price, close_reason, signal_type
+            FROM positions
+            WHERE status = 'closed'
+              AND closed_date >= CURRENT_DATE - INTERVAL '7 days'
+            ORDER BY closed_date ASC
+        """)
+        try:
+            with self.engine.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            print(f"📊 今週のクローズトレード: {len(df)} 件")
+            return df
+        except Exception as e:
+            print(f"❌ 週次トレード読み込みエラー: {e}")
+            return pd.DataFrame()
+
+    def load_all_closed_trades(self) -> pd.DataFrame:
+        """累計の全クローズトレードを取得する。"""
+        sql = text("""
+            SELECT
+                ticker, entry_date, entry_price,
+                closed_date, exit_price, close_reason, signal_type
+            FROM positions
+            WHERE status = 'closed'
+              AND exit_price IS NOT NULL
+            ORDER BY closed_date ASC
+        """)
+        try:
+            with self.engine.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            print(f"📊 累計クローズトレード: {len(df)} 件")
+            return df
+        except Exception as e:
+            print(f"❌ 累計トレード読み込みエラー: {e}")
+            return pd.DataFrame()
 
     def get_latest_saved_date(self) -> str | None:
         """保存済みの最新日を返す。"""
