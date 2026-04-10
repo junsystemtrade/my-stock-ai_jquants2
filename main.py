@@ -1,8 +1,8 @@
 """
 main.py
 =======
-毎日の銘柄スキャン + Discord 通知のエントリーポイント。
-GitHub Actions の daily workflow から呼ばれる。
+google-genai SDK (Gemini 2.0 Flash) を使用。
+signal_engine のリサーチロジックを統合し、詳細な日本語レポートを生成。
 """
 
 import os
@@ -10,7 +10,6 @@ import sys
 import requests
 import pandas as pd
 import yfinance as yf
-# 新しい google-genai SDK をインポート
 from google import genai
 
 import portfolio_manager
@@ -20,154 +19,120 @@ from database_manager import DBManager
 from scoring_system import calculate_score
 from signal_engine import _load_config, _get_market_condition
 
-# --- Gemini API 設定 (google-genai 対応) ---
+# --- Gemini API 設定 ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if GOOGLE_API_KEY:
-    # 新しい SDK のクライアント生成方法
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-else:
-    client = None
+client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
 # -----------------------------------------------------------------------
-# 外部情報の取得 (Gemini & yfinance)
+# Gemini による詳細企業リサーチ
 # -----------------------------------------------------------------------
-def get_company_info_and_topic(ticker: str, company_name: str):
-    """事業概要と直近トピックを取得する"""
-    business_summary = "（企業調査エラー）"
-    topic_comment = "（トピック取得エラー）"
+def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
+    """
+    以前の signal_engine.py のロジックを活用し、
+    企業名、事業概要、最新トピックを Gemini から一括取得する。
+    """
+    code = ticker.replace(".T", "")
     
-    # 1. yfinance で事業概要を取得
+    # デフォルト値
+    name = code
+    summary = "（調査中）"
+    topic = "（トピック取得エラー）"
+
+    if not client:
+        return name, summary, "（APIキー未設定）"
+
+    # プロンプト（signal_engine のエッセンスを統合）
+    prompt = f"""
+あなたは企業リサーチアナリストです。以下の銘柄について、企業の基本情報を日本語で調査・整理してください。
+
+銘柄コード: {code}
+検知されたシグナル: {signal_type}
+シグナル詳細: {reason}
+
+【出力形式】
+1行目: 正確な企業名
+2行目: 【事業概要】（主力事業、業界ポジションを30文字程度で）
+3行目以降: 【最新トピック】（IR、提携、業績、シグナルとの関連ファクトを100文字程度で）
+
+※売買の予想・推奨は一切禁止。
+"""
+
     try:
-        t_info = yf.Ticker(ticker).info
-        # 日本語の概要があれば優先、なければ英語の短縮名など
-        business_summary = t_info.get('longBusinessSummary') or t_info.get('shortName') or "（情報なし）"
-        # 文字数制限（Discord 対策で短くカット）
-        if len(business_summary) > 60:
-            business_summary = business_summary[:57] + "..."
+        # モデルは 2.0 Flash を使用
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        res_text = response.text.strip().split('\n')
+        
+        # 応答のパース（最低限の分割）
+        if len(res_text) >= 1:
+            name = res_text[0].strip()
+        
+        full_body = "\n".join(res_text[1:])
+        if "【最新トピック】" in full_body:
+            parts = full_body.split("【最新トピック】")
+            summary = parts[0].replace("【事業概要】", "").strip()
+            topic = parts[1].strip()
+        else:
+            topic = full_text
+
     except Exception as e:
-        print(f"⚠️ yfinance エラー ({ticker}): {e}")
+        topic = f"（リサーチエラー: {e}）"
 
-    # 2. Gemini で直近トピックを生成 (google-genai SDK 仕様)
-    if client:
-        prompt = f"""
-        日本の株式銘柄「{company_name} ({ticker})」について、ここ数日の重要ニュースやトピックを100文字程度で簡潔に要約してください。
-        特にニュースがない場合は、その企業の現在の強みについて触れてください。
-        """
-        try:
-            # 新しい SDK では client.models.generate_content を使用
-            response = client.models.generate_content(
-                model='gemini-1.5-flash',
-                contents=prompt
-            )
-            topic_comment = response.text.strip()
-        except Exception as e:
-            topic_comment = f"（Geminiエラー: {e}）"
-    else:
-        topic_comment = "（GOOGLE_API_KEY 未設定）"
-
-    return business_summary, topic_comment
+    return name, summary, topic
 
 # -----------------------------------------------------------------------
 # Discord 通知
 # -----------------------------------------------------------------------
 def send_discord(content: str):
     url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-    if not url:
-        print("⚠️ DISCORD_WEBHOOK_URL が未設定です。通知をスキップします。")
-        return
+    if not url: return
     for i in range(0, len(content), 1990):
         chunk = content[i : i + 1990]
-        res = requests.post(url, json={"content": chunk})
-        if res.status_code not in (200, 204):
-            print(f"❌ Discord 送信エラー: {res.status_code}")
+        requests.post(url, json={"content": chunk})
 
 # -----------------------------------------------------------------------
-# メイン処理 (変更なし)
+# メイン処理
 # -----------------------------------------------------------------------
 def main():
-    print("🚀 システム起動: 株式分析プロセスを開始します")
-    
+    print("🚀 システム起動: 専門リサーチモード")
     cfg = _load_config()
 
-    # 1. データ同期
-    print("\n--- STEP 1: データ同期 ---")
-    try:
-        portfolio_manager.sync_data()
-    except Exception as e:
-        msg = f"❌ データ同期エラー: {e}"
-        print(msg)
-        send_discord(msg)
-        sys.exit(1)
-
-    # 2. データロード
-    print("\n--- STEP 2: データロード ---")
+    # STEP 1-2: データ同期とロード
+    portfolio_manager.sync_data()
     db = DBManager()
     daily_data = db.load_analysis_data(days=150)
+    if daily_data.empty: return
 
-    if daily_data.empty:
-        msg = "⚠️ DBにデータがありません。先にバックフィルを実行してください。"
-        print(msg)
-        send_discord(msg)
-        sys.exit(0)
-
-    # 3. 市場環境チェック
-    print("\n--- STEP 3: 市場環境チェック ---")
+    # STEP 3: 市場環境
     market_change, market_status = _get_market_condition()
     
-    if market_status == "不明":
-        print("ℹ️ NIY=Fデータが不足しているため、地合い判定は「不明」として続行します。")
-
-    crash_threshold = cfg.get("filter", {}).get("market_breaker", {}).get("drop_threshold_pct", -2.0)
-    print(f"市場ステータス: {market_status} (NIY=F: {market_change:+.2f}%)")
-
-    if market_change <= crash_threshold:
-        msg = (
-            f"📉 **【市場警戒：スキャン停止】**\n"
-            f"日経平均先物が大幅下落（{market_change:+.2f}%）したため、リスク回避として新規探索を中止しました。\n"
-        )
-        print(msg)
-        send_discord(msg)
+    # STEP 4: シグナルスキャン
+    raw_signals = signal_engine.scan_signals(daily_data, market_status=market_status)
+    if not raw_signals:
+        send_discord(f"📊 地合い: {market_status}\n✅ 本日のスキャン完了：対象なし")
         return
+
+    # スコアリング
+    scoring_cfg = cfg.get('scoring_logic', {})
+    for s in raw_signals:
+        s["score"] = calculate_score(pd.Series(s), scoring_cfg)
     
-    print("✅ 市場環境良好。スキャンを継続します。")
+    signals = sorted(raw_signals, key=lambda x: x.get("score", 0), reverse=True)[:3]
 
-    # 4. シグナルスキャン & スコアリング
-    print("\n--- STEP 4: シグナルスキャン & スコアリング ---")
-    try:
-        raw_signals = signal_engine.scan_signals(daily_data, market_status=market_status)
-        
-        if not raw_signals:
-            send_discord("✅ 本日のスキャン完了：基準を満たす銘柄はありませんでした。")
-            return
-
-        scoring_cfg = cfg.get('scoring_logic', {})
-        for s in raw_signals:
-            s["score"] = calculate_score(pd.Series(s), scoring_cfg)
-        
-        signals = sorted(raw_signals, key=lambda x: x.get("score", 0), reverse=True)[:3]
-
-    except Exception as e:
-        msg = f"❌ 解析プロセスエラー: {e}"
-        print(msg)
-        send_discord(msg)
-        sys.exit(1)
-
-    # 5. Discord 通知
-    print("\n--- STEP 5: Discord 通知 ---")
+    # STEP 5: レポート作成
     report = "🏛️ **【株式シグナル検知：厳選TOP3】**\n"
     report += f"📊 判定地合い: **{market_status}**\n"
     report += "━" * 20 + "\n"
 
     for i, s in enumerate(signals, 1):
-        ticker = s['ticker']
-        company_name = s.get('company_name') or ticker.replace('.T', '')
-        
-        # 追加情報の取得
-        business, topic = get_company_info_and_topic(ticker, company_name)
+        # 以前の signal_engine 風ロジックで Gemini に調査させる
+        name, business, topic = get_detailed_research(s['ticker'], s['signal_type'], s['reason'])
 
         report += (
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"**{company_name}** ({ticker} / {int(s['price']):,}円)\n"
+            f"**{name}** ({s['ticker']} / {int(s['price']):,}円)\n"
             f"**事業概要**: {business}\n"
             f"**シグナル**: {s['signal_type']}\n"
             f"**根拠**: {s['reason']}\n"
@@ -176,8 +141,7 @@ def main():
         )
 
     send_discord(report)
-    print(f"✅ 上位 {len(signals)} 件を送信してプロセス正常終了")
-
+    print("✅ プロセス正常終了")
 
 if __name__ == "__main__":
     main()
