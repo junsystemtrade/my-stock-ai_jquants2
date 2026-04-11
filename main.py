@@ -80,11 +80,11 @@ def main():
             ticker=s["ticker"],
             entry_date=today,
             entry_price=s["price"],
-
-    if __name__ == "__main__":
-    main()
             signal_type=s["signal_type"],
         )
 
     send_discord(report)
     print("✅ 全プロセス正常終了")
+
+if __name__ == "__main__":
+    main()
