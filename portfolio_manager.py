@@ -116,50 +116,57 @@ def _prev_business_day(d):
     while d.weekday() >= 5: d -= timedelta(days=1)
     return d
 
+# portfolio_manager.py の sync_data() を修正
+
 def sync_data():
-    """
-    日次の差分更新：
-    バックフィル進捗に関わらず、直近7日分のデータを取得し、
-    NIY=FおよびDBに存在する銘柄を最新に保つ。
-    """
     db = database_manager.DBManager()
     target_end = _prev_business_day(_today_jst())
-    
+    target_start = target_end - timedelta(days=7)
+
     # 銘柄リスト準備
     target_stock_map = get_target_tickers()
     all_tickers = list(target_stock_map.keys())
     if MARKET_TICKER not in all_tickers:
         all_tickers.append(MARKET_TICKER)
 
-    # 4,000銘柄を一括リクエストすると重いため、
-    # 「すでにDBにある銘柄」+「NIY=F」に絞り込む
     from sqlalchemy import text
     try:
         with db.engine.connect() as conn:
-            existing = {row[0] for row in conn.execute(text("SELECT ticker FROM daily_prices GROUP BY ticker"))}
+            # ★ 直近7日以内にデータが存在する銘柄を取得
+            result = conn.execute(text("""
+                SELECT DISTINCT ticker 
+                FROM daily_prices 
+                WHERE date >= :since
+            """), {"since": target_start})
+            already_updated = {row[0] for row in result}
     except:
-        existing = set()
-    
-    # NIY=F はDBになくても必ず取得対象にする
-    sync_targets = [t for t in all_tickers if t in existing or t == MARKET_TICKER]
+        already_updated = set()
+
+    # ★ 未更新の銘柄のみ対象にする
+    sync_targets = [
+        t for t in all_tickers
+        if t not in already_updated
+    ]
+
+    if not sync_targets:
+        print("✅ 全銘柄は最新状態です。同期をスキップします。")
+        return
 
     print(f"🔄 同期開始 (ターゲット日: {target_end})")
-    print(f"📦 対象銘柄数: {len(sync_targets)}")
+    print(f"📦 未更新銘柄数: {len(sync_targets)}")
 
-    # 直近7日分をガバッと取って「重複スキップ(DB側)」に任せる
-    start_date = target_end - timedelta(days=7)
-    
-    # 銘柄数が多い可能性があるため、同期も念のためチャンク分割(100銘柄ずつ)
     chunk_size = 100
     for i in range(0, len(sync_targets), chunk_size):
         chunk = sync_targets[i : i + chunk_size]
-        df = _yf_fetch_chunk(chunk, start_date.strftime("%Y-%m-%d"), 
-                             (target_end + timedelta(days=1)).strftime("%Y-%m-%d"))
-        
+        df = _yf_fetch_chunk(
+            chunk,
+            target_start.strftime("%Y-%m-%d"),
+            (target_end + timedelta(days=1)).strftime("%Y-%m-%d")
+        )
         if not df.empty:
             db.save_prices(df)
-            
-    print(f"✨ 同期処理が終了しました（NIY=F含む）")
+
+    print("✨ 同期処理が終了しました")
 
 def backfill_data():
     """過去数年分のデータを一括取得（初回用）"""
