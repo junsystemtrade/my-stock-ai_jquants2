@@ -2,13 +2,12 @@
 main.py
 =======
 クォータ対策 (429 RESOURCE_EXHAUSTED) を強化した最新安定版。
-google-genai SDK と gemini-1.5-flash を使用。
-JQuants APIによる銘柄名取得機能を追加。
+google-genai SDK と gemini-2.0-flash を使用。
+JQuants V2 APIキー方式による銘柄名取得機能を追加。
 """
 
 import os
 import time
-import functools
 import requests
 import pandas as pd
 from google import genai
@@ -25,43 +24,18 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
 # -----------------------------------------------------------------------
-# JQuants API 認証・銘柄名取得
+# JQuants V2 API 銘柄名取得
 # -----------------------------------------------------------------------
-@functools.lru_cache(maxsize=1)
-def _get_jquants_access_token() -> str | None:
-    """
-    リフレッシュトークンからアクセストークンを取得。
-    lru_cacheにより1プロセス中は1回だけ実行される。
-    """
-    refresh_token = os.getenv("JQUANTS_API_KEY", "").strip()
-    if not refresh_token:
+def _get_company_name_from_jquants(code: str) -> str | None:
+    """JQuants V2 APIキー方式で銘柄名を取得。失敗時はNoneを返す。"""
+    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
+    if not api_key:
         print("⚠️ JQUANTS_API_KEY が未設定です")
         return None
     try:
-        res = requests.post(
-            "https://api.jquants.com/v1/token/auth_refresh",
-            params={"refreshtoken": refresh_token},
-            timeout=10
-        )
-        res.raise_for_status()
-        token = res.json().get("idToken")
-        if token:
-            print("✅ JQuantsアクセストークン取得成功")
-        return token
-    except Exception as e:
-        print(f"⚠️ JQuantsトークン取得失敗: {e}")
-        return None
-
-
-def _get_company_name_from_jquants(code: str) -> str | None:
-    """JQuants APIから銘柄名を取得。失敗時はNoneを返す。"""
-    token = _get_jquants_access_token()
-    if not token:
-        return None
-    try:
         res = requests.get(
-            "https://api.jquants.com/v1/listed/info",
-            headers={"Authorization": f"Bearer {token}"},
+            "https://api.jquants.com/v2/listed/info",
+            headers={"x-api-key": api_key},
             params={"code": code},
             timeout=10
         )
@@ -79,13 +53,13 @@ def _get_company_name_from_jquants(code: str) -> str | None:
 # -----------------------------------------------------------------------
 def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
     """
-    銘柄名はJQuants APIを優先取得。
+    銘柄名はJQuants V2 APIを優先取得。
     失敗時はGemini APIにフォールバック。
     """
     code = ticker.replace(".T", "")
     name, summary, topic = code, "（リサーチ制限中）", "⚠️ 情報を取得できませんでした。"
 
-    # STEP1: JQuants APIで銘柄名を取得（高速・安定）
+    # STEP1: JQuants V2 APIで銘柄名を取得（高速・安定）
     jquants_name = _get_company_name_from_jquants(code)
     if jquants_name:
         name = jquants_name
@@ -104,7 +78,7 @@ def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
         try:
             time.sleep(attempt * 5)
             response = client.models.generate_content(
-                model="gemini-1.5-flash",
+                model="gemini-2.0-flash",  # ← gemini-1.5-flash から変更
                 contents=prompt,
             )
             text = response.text.strip()
