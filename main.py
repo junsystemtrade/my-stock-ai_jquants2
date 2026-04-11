@@ -3,7 +3,7 @@ main.py
 =======
 クォータ対策 (429 RESOURCE_EXHAUSTED) を強化した最新安定版。
 google-genai SDK と gemini-2.0-flash を使用。
-JQuants V2 APIキー方式による銘柄名取得機能を追加。
+JPXマスターによる銘柄名取得機能を追加。
 """
 
 import os
@@ -24,28 +24,32 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
 # -----------------------------------------------------------------------
-# JQuants V2 API 銘柄名取得
+# JPXマスターから銘柄名取得（キャッシュ付き）
 # -----------------------------------------------------------------------
-def _get_company_name_from_jquants(code: str) -> str | None:
-    """JQuants V2 APIキー方式で銘柄名を取得。失敗時はNoneを返す。"""
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    if not api_key:
-        print("⚠️ JQUANTS_API_KEY が未設定です")
-        return None
+_ticker_name_cache: dict = {}
+
+def _load_ticker_names() -> dict:
+    """JPXマスターから銘柄名辞書を取得してキャッシュする。"""
+    global _ticker_name_cache
+    if _ticker_name_cache:
+        return _ticker_name_cache
     try:
-        res = requests.get(
-            "https://api.jquants.com/v2/listed/info",
-            headers={"x-api-key": api_key},
-            params={"code": code},
-            timeout=10
-        )
-        res.raise_for_status()
-        data = res.json().get("info", [])
-        if data:
-            return data[0].get("CompanyName", None)
+        stock_map = portfolio_manager.get_target_tickers()
+        # {"7250.T": {"name": "太平洋工業"}} → {"7250": "太平洋工業"}
+        _ticker_name_cache = {
+            k.replace(".T", ""): v["name"]
+            for k, v in stock_map.items()
+        }
+        print(f"✅ 銘柄名キャッシュ構築完了: {len(_ticker_name_cache)} 件")
     except Exception as e:
-        print(f"⚠️ JQuants銘柄名取得失敗 ({code}): {e}")
-    return None
+        print(f"⚠️ 銘柄名キャッシュ構築失敗: {e}")
+    return _ticker_name_cache
+
+
+def _get_company_name(code: str) -> str | None:
+    """JPXマスターから銘柄名を取得する。"""
+    names = _load_ticker_names()
+    return names.get(code, None)
 
 
 # -----------------------------------------------------------------------
@@ -53,24 +57,24 @@ def _get_company_name_from_jquants(code: str) -> str | None:
 # -----------------------------------------------------------------------
 def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
     """
-    銘柄名はJQuants V2 APIを優先取得。
-    失敗時はGemini APIにフォールバック。
+    銘柄名はJPXマスターから取得。
+    事業概要・トピックはGemini APIで取得（失敗時はデフォルト値）。
     """
     code = ticker.replace(".T", "")
     name, summary, topic = code, "（リサーチ制限中）", "⚠️ 情報を取得できませんでした。"
 
-    # STEP1: JQuants V2 APIで銘柄名を取得（高速・安定）
-    jquants_name = _get_company_name_from_jquants(code)
-    if jquants_name:
-        name = jquants_name
-        print(f"✅ JQuants銘柄名取得成功: {code} → {name}")
+    # STEP1: JPXマスターから銘柄名を取得
+    jpx_name = _get_company_name(code)
+    if jpx_name:
+        name = jpx_name
+        print(f"✅ 銘柄名取得成功: {code} → {name}")
 
     if not client:
         return name, summary, "（APIキー未設定）"
 
     # STEP2: Geminiで事業概要とトピックを取得
-    if jquants_name:
-        prompt = f"企業名:{jquants_name}（銘柄コード{code}）について回答。1行目:【事業概要】(30字以内)、2行目:【最新トピック】(100字以内)。投資助言禁止。日本語必須。"
+    if jpx_name:
+        prompt = f"企業名:{jpx_name}（銘柄コード{code}）について回答。1行目:【事業概要】(30字以内)、2行目:【最新トピック】(100字以内)。投資助言禁止。日本語必須。"
     else:
         prompt = f"銘柄コード{code}の日本企業について回答。1行目:企業名のみ、2行目:【事業概要】(30字以内)、3行目:【最新トピック】(100字以内)。投資助言禁止。日本語必須。"
 
@@ -78,13 +82,13 @@ def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
         try:
             time.sleep(attempt * 5)
             response = client.models.generate_content(
-                model="gemini-2.0-flash",  # ← gemini-1.5-flash から変更
+                model="gemini-2.0-flash",
                 contents=prompt,
             )
             text = response.text.strip()
             lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-            if jquants_name:
+            if jpx_name:
                 body = "\n".join(lines)
                 if "【最新トピック】" in body:
                     parts = body.split("【最新トピック】")
@@ -192,6 +196,9 @@ def main():
     signals = sorted(raw_signals, key=lambda x: x.get("score", 0), reverse=True)[:3]
 
     # STEP 6: 買いシグナルレポート作成
+    # 銘柄名キャッシュを事前構築（sync_data後なのでJPX取得済み）
+    _load_ticker_names()
+
     report = "🏛️ **【株式シグナル検知：厳選TOP3】**\n"
     report += f"📊 判定地合い: **{market_status}**\n"
     report += "━" * 20 + "\n"
