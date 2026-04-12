@@ -2,7 +2,7 @@
 signal_engine.py
 ================
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
-手じまいシグナル判定機能を追加。
+手じまいシグナル判定・トレーリング・ストップ高除外機能を追加。
 """
 
 import os
@@ -36,6 +36,18 @@ def _load_config() -> dict:
             "exclude_code_range": [[1000, 1999]],
             "max_signals_per_ticker": 1,
         },
+        "exit_rules": {
+            "immediate": {"dead_cross": True, "rsi_overbought": 70},
+            "hold_days": 10,
+            "trailing": {
+                "enabled": True,
+                "conditions": {
+                    "golden_cross_maintained": True,
+                    "rsi_below": 70,
+                    "profit_required": True,
+                }
+            }
+        }
     }
 
 # -----------------------------------------------------------------------
@@ -49,54 +61,83 @@ def _get_market_condition() -> tuple[float, str]:
         WHERE ticker = 'NIY=F' 
         ORDER BY date DESC LIMIT 2
     """)
-    
     try:
         with db.engine.connect() as conn:
             df_niy = pd.read_sql(query, conn)
-        
         if len(df_niy) < 2:
             return 0.0, "不明"
-
-        p_now, p_prev = float(df_niy['price'].iloc[0]), float(df_niy['price'].iloc[1])
+        p_now  = float(df_niy['price'].iloc[0])
+        p_prev = float(df_niy['price'].iloc[1])
         m_change = (p_now - p_prev) / p_prev * 100
-        
-        if m_change <= -2.0: status = "暴落警戒"
+        if m_change <= -2.0:   status = "暴落警戒"
         elif m_change <= -0.5: status = "軟調"
-        elif m_change >= 0.5: status = "好調"
-        else: status = "平穏"
-            
+        elif m_change >= 0.5:  status = "好調"
+        else:                  status = "平穏"
         return round(m_change, 2), status
     except Exception as e:
         print(f"⚠️ 地合い判定失敗: {e}")
         return 0.0, "エラー"
 
 # -----------------------------------------------------------------------
+# ストップ高判定
+# -----------------------------------------------------------------------
+def _is_stop_high(price: float, prev_price: float) -> bool:
+    """東証ルールに基づきストップ高に達しているか判定する"""
+    if prev_price <= 0:
+        return False
+    if prev_price < 100:        limit = 30
+    elif prev_price < 200:      limit = 50
+    elif prev_price < 500:      limit = 80
+    elif prev_price < 700:      limit = 100
+    elif prev_price < 1000:     limit = 150
+    elif prev_price < 1500:     limit = 300
+    elif prev_price < 2000:     limit = 400
+    elif prev_price < 3000:     limit = 500
+    elif prev_price < 5000:     limit = 700
+    elif prev_price < 7000:     limit = 1000
+    elif prev_price < 10000:    limit = 1500
+    elif prev_price < 15000:    limit = 3000
+    elif prev_price < 20000:    limit = 4000
+    elif prev_price < 30000:    limit = 5000
+    elif prev_price < 50000:    limit = 7000
+    elif prev_price < 70000:    limit = 10000
+    elif prev_price < 100000:   limit = 15000
+    elif prev_price < 150000:   limit = 30000
+    elif prev_price < 200000:   limit = 40000
+    elif prev_price < 300000:   limit = 50000
+    elif prev_price < 500000:   limit = 70000
+    elif prev_price < 700000:   limit = 100000
+    elif prev_price < 1000000:  limit = 150000
+    else:                       limit = 200000
+    return (price - prev_price) >= limit
+
+# -----------------------------------------------------------------------
 # 指標計算（ベクトル演算で高速化）
 # -----------------------------------------------------------------------
 def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    close = df["price"].astype(float)
+    close  = df["price"].astype(float)
     volume = df["volume"].astype(float)
-    
-    df['volume_ratio'] = volume / volume.rolling(window=5).mean().shift(1)
-    
+
+    df['volume_ratio']   = volume / volume.rolling(window=5).mean().shift(1)
+
     ma25 = close.rolling(window=25).mean()
-    df['mavg_25_diff'] = (close - ma25) / ma25 * 100
+    df['mavg_25_diff']   = (close - ma25) / ma25 * 100
 
     ma5 = close.rolling(window=5).mean()
-    df['mavg_5_diff'] = (close - ma5) / ma5 * 100
-    df['sma_5'] = ma5
-    df['sma_25'] = ma25
+    df['mavg_5_diff']    = (close - ma5) / ma5 * 100
+    df['sma_5']          = ma5
+    df['sma_25']         = ma25
 
-    df['turnover'] = close * volume
+    df['turnover']       = close * volume
     df['turnover_avg_20'] = df['turnover'].rolling(window=20).mean()
 
-    df['is_above_ma25'] = close > ma25
-    df['ma25_upward'] = ma25.diff() > 0
+    df['is_above_ma25']  = close > ma25
+    df['ma25_upward']    = ma25.diff() > 0
 
     delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain  = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss  = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['rsi_14'] = 100 - (100 / (1 + (gain / loss.replace(0, float("nan")))))
 
     return df
@@ -106,20 +147,36 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------
 def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     code_str = ticker.replace(".T", "").strip()
-    if any(r[0] <= int(code_str) <= r[1] for r in cfg["filter"].get("exclude_code_range", []) if code_str.isdigit()):
+    if any(
+        r[0] <= int(code_str) <= r[1]
+        for r in cfg["filter"].get("exclude_code_range", [])
+        if code_str.isdigit()
+    ):
         return []
 
     df = _calculate_indicators(df)
-    
+
     min_days = cfg["filter"].get("min_data_days", 80)
-    if len(df) < min_days: return []
-    
-    row = df.iloc[-1]
-    price = float(row["price"])
-    
+    if len(df) < min_days:
+        return []
+
+    row      = df.iloc[-1]
+    prev_row = df.iloc[-2] if len(df) >= 2 else None
+    price    = float(row["price"])
+
+    # ストップ高チェック
+    stop_high_cfg = cfg.get("filter", {}).get("stop_high", {})
+    if stop_high_cfg.get("enabled", True) and prev_row is not None:
+        if _is_stop_high(price, float(prev_row["price"])):
+            print(f"⛔ {ticker}: ストップ高のためスキャン除外")
+            return []
+
+    # フィルタ判定
     min_turnover = cfg["filter"].get("min_daily_turnover_avg_20", 500000000)
-    if row["turnover_avg_20"] < min_turnover: return []
-    if not (cfg["filter"]["min_price"] <= price <= cfg["filter"]["max_price"]): return []
+    if row["turnover_avg_20"] < min_turnover:
+        return []
+    if not (cfg["filter"]["min_price"] <= price <= cfg["filter"]["max_price"]):
+        return []
 
     res = []
     sma_s = df["price"].rolling(window=5).mean()
@@ -133,74 +190,109 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     if row["volume_ratio"] >= cfg["signals"]["volume_surge"]["multiplier"]:
         res.append({"signal_type": "出来高急増", "reason": f"出来高 {row['volume_ratio']:.1f}倍", "priority": 3})
 
-    if not res: return []
+    if not res:
+        return []
 
     best_signal = sorted(res, key=lambda x: x["priority"])[0]
     best_signal.update({
-        "ticker": ticker, 
-        "price": price, 
+        "ticker": ticker,
+        "price":  price,
         **row.to_dict()
     })
     return [best_signal]
 
 # -----------------------------------------------------------------------
-# 手じまいシグナル判定
+# 手じまいシグナル判定（トレーリング対応）
 # -----------------------------------------------------------------------
-def check_exit_signals(daily_data: pd.DataFrame, hold_days: int = 10) -> list[dict]:
+def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     """
     オープンポジションに対して手じまい条件を判定する。
-    条件1（テクニカル）: デッドクロス（5日線が25日線を下抜け）またはRSI70超え
-    条件2（保有日数）  : entry_dateから hold_days 日以上経過
+
+    【10日未満】
+      即時手じまい条件:
+        - デッドクロス（5日線が25日線を下抜け）
+        - RSI70超え
+
+    【10日以降】毎日トレーリング判定:
+      以下の全条件を満たす場合のみ保有継続、1つでも外れたら手じまい
+        - ①5日線 > 25日線（ゴールデンクロス維持）
+        - ②RSI < 70（過熱感なし）
+        - ③含み益がプラス
     """
+    cfg = _load_config()
+    exit_cfg = cfg.get("exit_rules", {})
+    immediate_cfg  = exit_cfg.get("immediate", {})
+    hold_days      = exit_cfg.get("hold_days", 10)
+    trailing_cfg   = exit_cfg.get("trailing", {})
+    trailing_on    = trailing_cfg.get("enabled", True)
+    trail_cond     = trailing_cfg.get("conditions", {})
+    rsi_overbought = immediate_cfg.get("rsi_overbought", 70)
+
     db = database_manager.DBManager()
     open_positions = db.load_open_positions()
     if open_positions.empty:
         print("📂 オープンポジションなし")
         return []
 
-    today = daily_data["date"].max()
+    today        = daily_data["date"].max()
     exit_signals = []
 
     for _, pos in open_positions.iterrows():
-        ticker = pos["ticker"]
-        entry_date = pd.to_datetime(pos["entry_date"]).date()
+        ticker      = pos["ticker"]
+        entry_date  = pd.to_datetime(pos["entry_date"]).date()
         entry_price = float(pos["entry_price"])
 
         df_ticker = daily_data[daily_data["ticker"] == ticker].sort_values("date")
         if df_ticker.empty or len(df_ticker) < 26:
             continue
 
-        df_ticker = _calculate_indicators(df_ticker)
-        row = df_ticker.iloc[-1]
+        df_ticker     = _calculate_indicators(df_ticker)
+        row           = df_ticker.iloc[-1]
         current_price = float(row["price"])
-        pnl_pct = (current_price - entry_price) / entry_price * 100
+        pnl_pct       = (current_price - entry_price) / entry_price * 100
+        held_days     = (pd.to_datetime(today).date() - entry_date).days
 
+        sma_s       = df_ticker["sma_5"]
+        sma_l       = df_ticker["sma_25"]
+        is_gc       = sma_s.iloc[-1] > sma_l.iloc[-1]
+        is_dc       = len(sma_s) > 1 and sma_s.iloc[-2] >= sma_l.iloc[-2] and sma_s.iloc[-1] < sma_l.iloc[-1]
+        rsi         = float(row["rsi_14"])
         exit_reason = None
 
-        # 条件1: テクニカル手じまい
-        sma_s = df_ticker["sma_5"]
-        sma_l = df_ticker["sma_25"]
-        if len(sma_s) > 1 and sma_s.iloc[-2] >= sma_l.iloc[-2] and sma_s.iloc[-1] < sma_l.iloc[-1]:
-            exit_reason = "💀 デッドクロス発生"
-        elif row["rsi_14"] >= 70:
-            exit_reason = f"🌡️ RSI過熱 ({row['rsi_14']:.1f})"
-
-        # 条件2: 保有日数超過
-        if exit_reason is None:
-            held_days = (pd.to_datetime(today).date() - entry_date).days
-            if held_days >= hold_days:
-                exit_reason = f"⏰ 保有{held_days}日経過"
+        if held_days < hold_days:
+            # ─── 10日未満: 即時手じまい条件のみチェック ───
+            if immediate_cfg.get("dead_cross", True) and is_dc:
+                exit_reason = "💀 デッドクロス発生"
+            elif rsi >= rsi_overbought:
+                exit_reason = f"🌡️ RSI過熱 ({rsi:.1f})"
+        else:
+            # ─── 10日以降: トレーリング判定（毎日） ───
+            if trailing_on:
+                reasons = []
+                if trail_cond.get("golden_cross_maintained", True) and not is_gc:
+                    reasons.append("5日線<25日線")
+                if rsi >= trail_cond.get("rsi_below", 70):
+                    reasons.append(f"RSI過熱({rsi:.1f})")
+                if trail_cond.get("profit_required", True) and pnl_pct <= 0:
+                    reasons.append("含み損転落")
+                if reasons:
+                    exit_reason = f"📉 トレーリング手じまい（{' / '.join(reasons)}）"
+                else:
+                    print(f"✅ {ticker}: 保有継続（{held_days}日目 / 含み益{pnl_pct:+.2f}%）")
+            else:
+                # トレーリング無効時は期間満了で手じまい
+                exit_reason = f"⏰ 保有{held_days}日経過（期間満了）"
 
         if exit_reason:
             exit_signals.append({
-                "ticker": ticker,
-                "entry_date": entry_date,
-                "entry_price": entry_price,
+                "ticker":        ticker,
+                "entry_date":    entry_date,
+                "entry_price":   entry_price,
                 "current_price": current_price,
-                "pnl_pct": round(pnl_pct, 2),
-                "exit_reason": exit_reason,
+                "pnl_pct":       round(pnl_pct, 2),
+                "exit_reason":   exit_reason,
+                "held_days":     held_days,
             })
-            # ★ exit_price を追加
             db.close_position(
                 ticker=ticker,
                 entry_date=entry_date,
@@ -216,7 +308,8 @@ def check_exit_signals(daily_data: pd.DataFrame, hold_days: int = 10) -> list[di
 # メインスキャン（買いシグナル）
 # -----------------------------------------------------------------------
 def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[dict]:
-    if daily_data.empty: return []
+    if daily_data.empty:
+        return []
     cfg = _load_config()
 
     market_change, market_status_actual = _get_market_condition()
