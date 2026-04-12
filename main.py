@@ -3,7 +3,7 @@ main.py
 =======
 クォータ対策 (429 RESOURCE_EXHAUSTED) を強化した最新安定版。
 google-genai SDK と gemini-2.0-flash を使用。
-JPXマスターによる銘柄名取得機能を追加。
+JPXマスターによる銘柄名取得・1銘柄1通知方式に対応。
 """
 
 import os
@@ -35,7 +35,6 @@ def _load_ticker_names() -> dict:
         return _ticker_name_cache
     try:
         stock_map = portfolio_manager.get_target_tickers()
-        # {"7250.T": {"name": "太平洋工業"}} → {"7250": "太平洋工業"}
         _ticker_name_cache = {
             k.replace(".T", ""): v["name"]
             for k, v in stock_map.items()
@@ -58,10 +57,14 @@ def _get_company_name(code: str) -> str | None:
 def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
     """
     銘柄名はJPXマスターから取得。
-    事業概要・トピックはGemini APIで取得（失敗時はデフォルト値）。
+    事業概要・トピック・シグナル考察はGeminiで取得。
+    戻り値: (name, summary, topic, consideration)
     """
     code = ticker.replace(".T", "")
-    name, summary, topic = code, "（リサーチ制限中）", "⚠️ 情報を取得できませんでした。"
+    name = code
+    summary = "（リサーチ制限中）"
+    topic = "⚠️ 情報を取得できませんでした。"
+    consideration = "（取得できませんでした）"
 
     # STEP1: JPXマスターから銘柄名を取得
     jpx_name = _get_company_name(code)
@@ -70,13 +73,14 @@ def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
         print(f"✅ 銘柄名取得成功: {code} → {name}")
 
     if not client:
-        return name, summary, "（APIキー未設定）"
+        return name, summary, topic, consideration
 
-    # STEP2: Geminiで事業概要とトピックを取得
-    if jpx_name:
-        prompt = f"企業名:{jpx_name}（銘柄コード{code}）について回答。1行目:【事業概要】(30字以内)、2行目:【最新トピック】(100字以内)。投資助言禁止。日本語必須。"
-    else:
-        prompt = f"銘柄コード{code}の日本企業について回答。1行目:企業名のみ、2行目:【事業概要】(30字以内)、3行目:【最新トピック】(100字以内)。投資助言禁止。日本語必須。"
+    # STEP2: Geminiで詳細情報を取得（1銘柄1通知なので文字数を最大活用）
+    prompt = f"""企業名:{jpx_name or code}（銘柄コード{code}）について以下の形式で回答してください。
+【事業概要】（300字以内）
+【直近トピック】（800字以内、決算・新製品・業績修正・株価動向など具体的な内容を含めること）
+【シグナルとの関連】シグナル「{signal_type}」根拠「{reason}」との関連を500字以内で詳しく考察
+投資助言は禁止。日本語必須。"""
 
     for attempt in range(3):
         try:
@@ -87,32 +91,23 @@ def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
             )
             text = response.text.strip()
             lines = [line.strip() for line in text.split('\n') if line.strip()]
+            body = "\n".join(lines)
 
-            if jpx_name:
-                body = "\n".join(lines)
-                if "【最新トピック】" in body:
-                    parts = body.split("【最新トピック】")
-                    summary = parts[0].replace("【事業概要】", "").replace(":", "").strip()
-                    topic = parts[1].strip()
-                elif len(lines) >= 2:
-                    summary = lines[0].replace("【事業概要】", "").replace(":", "").strip()
-                    topic = lines[1].replace("【最新トピック】", "").replace(":", "").strip()
-                elif len(lines) == 1:
-                    summary = lines[0].replace("【事業概要】", "").replace(":", "").strip()
+            # 各セクションをパース
+            if "【直近トピック】" in body and "【シグナルとの関連】" in body:
+                parts1 = body.split("【直近トピック】")
+                summary = parts1[0].replace("【事業概要】", "").replace(":", "").strip()
+                parts2 = parts1[1].split("【シグナルとの関連】")
+                topic = parts2[0].strip()
+                consideration = parts2[1].strip()
+            elif "【直近トピック】" in body:
+                parts1 = body.split("【直近トピック】")
+                summary = parts1[0].replace("【事業概要】", "").replace(":", "").strip()
+                topic = parts1[1].strip()
             else:
-                if len(lines) >= 1:
-                    name = lines[0].split(':', 1)[-1] if ':' in lines[0] else lines[0]
-                    name = name.replace("1.", "").replace("**", "").strip()
-                    body = "\n".join(lines[1:])
-                    if "【最新トピック】" in body:
-                        parts = body.split("【最新トピック】")
-                        summary = parts[0].replace("【事業概要】", "").replace("2.", "").replace(":", "").strip()
-                        topic = parts[1].replace("3.", "").replace(":", "").strip()
-                    else:
-                        summary = "（解析エラー：形式不一致）"
-                        topic = body[:150]
+                summary = body[:300]
 
-            return name, summary, topic
+            return name, summary, topic, consideration
 
         except Exception as e:
             print(f"⚠️ 銘柄{code} 試行{attempt+1}失敗: {e}")
@@ -120,7 +115,7 @@ def get_detailed_research(ticker: str, signal_type: str, reason: str) -> tuple:
                 time.sleep(20)
             continue
 
-    return name, summary, topic
+    return name, summary, topic, consideration
 
 
 # -----------------------------------------------------------------------
@@ -131,6 +126,7 @@ def send_discord(content: str):
     if not url:
         print("⚠️ Discord Webhook URL 未設定")
         return
+    # 万が一2000字を超えた場合の安全策
     for i in range(0, len(content), 1990):
         chunk = content[i : i + 1990]
         try:
@@ -195,32 +191,41 @@ def main():
     # 上位3件に絞り込み
     signals = sorted(raw_signals, key=lambda x: x.get("score", 0), reverse=True)[:3]
 
-    # STEP 6: 買いシグナルレポート作成
-    # 銘柄名キャッシュを事前構築（sync_data後なのでJPX取得済み）
+    # STEP 6: ヘッダーを先に送信
     _load_ticker_names()
+    header = (
+        f"🏛️ **【株式シグナル検知：厳選TOP3】**\n"
+        f"📊 判定地合い: **{market_status}**\n"
+        f"{'━' * 20}"
+    )
+    send_discord(header)
 
-    report = "🏛️ **【株式シグナル検知：厳選TOP3】**\n"
-    report += f"📊 判定地合い: **{market_status}**\n"
-    report += "━" * 20 + "\n"
-
+    # STEP 7: 1銘柄1通知でレポート送信
     for i, s in enumerate(signals, 1):
         print(f"⏳ 銘柄 {s['ticker']} リサーチ準備中...")
         time.sleep(15)
 
-        name, business, topic = get_detailed_research(s['ticker'], s['signal_type'], s['reason'])
+        name, business, topic, consideration = get_detailed_research(
+            s['ticker'], s['signal_type'], s['reason']
+        )
 
-        report += (
+        report = (
+            f"**{i}/3銘柄目**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"**{name}** ({s['ticker']} / {int(s['price']):,}円)\n"
-            f"**事業概要**: {business}\n"
             f"**シグナル**: {s['signal_type']}\n"
             f"**根拠**: {s['reason']}\n"
             f"**スコア**: {s['score']:.1f}点\n"
-            f"**直近トピック**: {topic}\n"
             f"────────────────────\n"
+            f"📋 **事業概要**\n{business}\n"
+            f"────────────────────\n"
+            f"📰 **直近トピック**\n{topic}\n"
+            f"────────────────────\n"
+            f"🔍 **シグナルとの関連**\n{consideration}\n"
         )
+        send_discord(report)
 
-    # STEP 7: 買いシグナル銘柄をDBに保存
+    # STEP 8: 買いシグナル銘柄をDBに保存
     today = daily_data["date"].max()
     for s in signals:
         db.save_position(
@@ -230,7 +235,6 @@ def main():
             signal_type=s["signal_type"],
         )
 
-    send_discord(report)
     print("✅ 全プロセス正常終了")
 
 
