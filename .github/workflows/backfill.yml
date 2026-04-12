@@ -2,45 +2,35 @@
 # =====================================
 # DBへの直近3年間株価データ格納のためのyml
 name: Initial Backfill (3 Years)
-
-
 on:
   workflow_dispatch:
   schedule:
-  - cron: "0 */7 * * *"  # ← */6 から */7 に変更
-  
+    - cron: "0 21 28 * *"  # 毎月28日 JST 06:00（UTC 21:00）に実行
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 340
-
     env:
-      DATABASE_URL:             ${{ secrets.DATABASE_URL }}
-      JQUANTS_API_KEY:          ${{ secrets.JQUANTS_API_KEY }}
-      GOOGLE_API_KEY:           ${{ secrets.GOOGLE_API_KEY }}
-      DISCORD_WEBHOOK_URL:      ${{ secrets.DISCORD_WEBHOOK_URL }}
-      JQUANTS_MIN_INTERVAL_SEC: "12.5"
-      YF_SINGLE_SLEEP:          "0.3"
-      YF_CHUNK_SIZE:            "50"
-      YF_SLEEP_SEC:             "3.0"
-      DB_CHUNK_SIZE:            "1000"
-
+      DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+      GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      YF_SINGLE_SLEEP:     "0.3"
+      YF_CHUNK_SIZE:       "50"
+      YF_SLEEP_SEC:        "3.0"
+      DB_CHUNK_SIZE:       "1000"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run backfill
         run: python portfolio_manager.py
-
       - name: Notify Discord
         if: always()
         env:
@@ -48,9 +38,9 @@ jobs:
         run: |
           STATUS="${{ job.status }}"
           if [ "$STATUS" = "success" ]; then
-            MSG="OK Backfill run completed. Will continue automatically every 30 min until done."
+            MSG="✅ 月次バックフィル完了（毎月28日定期実行）"
           else
-            MSG="INFO Backfill stopped (timeout or error). Auto-retrying in 30 min."
+            MSG="❌ 月次バックフィル失敗。手動で再実行してください。"
           fi
           curl -s -X POST "$DISCORD_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
