@@ -2,20 +2,17 @@
 # ==================
 # 戦略: トレンドフォロー・初動ブレイク狙い
 # ターゲット: 流動性の高い中大型株
-
 signals:
   # ---- ① トレンド発生のトリガー（ゴールデンクロスを初動として利用） ----
   golden_cross:
     enabled: true
     short_window: 5
     long_window: 25
-
   # ---- ② RSIによる「過熱感」のチェック ----
   rsi_oversold:
     enabled: true
     window: 14
     threshold: 50 
-
   # ---- ③ 出来高による「裏付け」 ----
   volume_surge:
     enabled: true
@@ -26,43 +23,57 @@ filter:
   min_price: 500
   max_price: 50000
   min_data_days: 80
-
   exclude_code_range:
     - [1300, 1699] # 主要なETF/ETN
     - [2000, 2099] # ETN
     - [2500, 2639] # ETF
     - [2840, 2859] # ETF
     - [8950, 8999] # REIT
-
-  min_daily_turnover_avg_20: 500000000 # 20日平均で5億円以上
+  min_daily_turnover_avg_20: 500000000
   max_signals_per_ticker: 1
-
   # ==================================================
   # ⑤ 市場全体の地合いフィルター（サーキットブレーカー）
   # ==================================================
   market_breaker:
     enabled: true
-    symbol: "NIY=F"            # 日経平均株価
-    drop_threshold_pct: -1.5   # 前日比 -1.5% 以下の下落で発動
+    symbol: "NIY=F"
+    drop_threshold_pct: -1.5
+  # ==================================================
+  # ⑥ ストップ高フィルター（翌朝成り行きで買えない銘柄を除外）
+  # ==================================================
+  stop_high:
+    enabled: true
 
 # ==================================================
 # ④ スコアリング（優先順位付け）のロジック実装定義
 # ==================================================
 scoring_logic:
   enabled: true
-
-  # 各指標の配点（合計100点）
   weights:
-    volume_surge: 40      # 出来高の勢い
-    bias_proximity: 30    # 25日線との近さ
-    rsi_position: 20      # RSIの立ち上がり
-    liquidity_scale: 10   # 売買代金の大きさ
-
-  # スコア算出のためのパラメータ
+    volume_surge: 40
+    bias_proximity: 30
+    rsi_position: 20
+    liquidity_scale: 10
   parameters:
     volume_max_multiplier: 5.0
     bias_limit_pct: 10.0
     turnover_ideal_min: 1000000000
-    
-    # --- 今回追加が必要な項目 ---
-    rsi_ideal_range: [40, 65]  # RSIが40〜65の間なら加点、といったロジック用
+    rsi_ideal_range: [40, 65]
+
+# ==================================================
+# ⑦ 手じまいロジック設定
+# ==================================================
+exit_rules:
+  # 即時手じまい（保有日数に関わらず）
+  immediate:
+    dead_cross: true          # デッドクロス発生
+    rsi_overbought: 70        # RSI過熱
+  # 通常手じまい（保有日数ベース）
+  hold_days: 10
+  # トレーリング（hold_days経過後の毎日判定）
+  trailing:
+    enabled: true
+    conditions:
+      golden_cross_maintained: true  # 5日線 > 25日線を維持
+      rsi_below: 70                  # RSI70未満
+      profit_required: true          # 含み益がプラスであること
