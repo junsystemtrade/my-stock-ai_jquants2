@@ -209,10 +209,24 @@ def main():
             s['ticker'], s['signal_type'], s['reason']
         )
 
+        # ★ 前日終値・前日比を計算
+        df_ticker = daily_data[daily_data["ticker"] == s["ticker"]].sort_values("date")
+        prev_close = None
+        prev_change_str = "（取得不可）"
+        if len(df_ticker) >= 2:
+            latest_price = float(df_ticker.iloc[-1]["price"])
+            prev_price   = float(df_ticker.iloc[-2]["price"])
+            prev_close   = latest_price
+            change_pct   = (latest_price - prev_price) / prev_price * 100
+            change_yen   = latest_price - prev_price
+            change_emoji = "📈" if change_pct >= 0 else "📉"
+            prev_change_str = f"{change_emoji} {change_yen:+.0f}円 ({change_pct:+.2f}%)"
+
         report = (
             f"**{i}/3銘柄目**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"**{name}** ({s['ticker']} / {int(s['price']):,}円)\n"
+            f"**{name}** ({s['ticker']})\n"
+            f"**前日終値**: {int(s['price']):,}円　{prev_change_str}\n"
             f"**シグナル**: {s['signal_type']}\n"
             f"**根拠**: {s['reason']}\n"
             f"**スコア**: {s['score']:.1f}点\n"
