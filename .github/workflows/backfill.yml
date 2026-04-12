@@ -1,4 +1,8 @@
+# .github/workflows/backfill.yml
+# =====================================
+# DBへの直近3年間株価データ格納のためのyml
 name: Initial Backfill (3 Years)
+
 
 on:
   workflow_dispatch:
