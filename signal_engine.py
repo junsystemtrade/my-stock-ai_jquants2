@@ -3,6 +3,7 @@ signal_engine.py
 ================
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
 手じまいシグナル判定・トレーリング・ストップ高除外機能を追加。
+JPXマスター除外・オープンポジション除外を追加。
 """
 
 import os
@@ -12,6 +13,7 @@ from datetime import date
 from pathlib import Path
 from sqlalchemy import text
 import database_manager
+import portfolio_manager
 
 # -----------------------------------------------------------------------
 # 設定の読み込み
@@ -119,21 +121,21 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close  = df["price"].astype(float)
     volume = df["volume"].astype(float)
 
-    df['volume_ratio']   = volume / volume.rolling(window=5).mean().shift(1)
+    df['volume_ratio']    = volume / volume.rolling(window=5).mean().shift(1)
 
     ma25 = close.rolling(window=25).mean()
-    df['mavg_25_diff']   = (close - ma25) / ma25 * 100
+    df['mavg_25_diff']    = (close - ma25) / ma25 * 100
 
     ma5 = close.rolling(window=5).mean()
-    df['mavg_5_diff']    = (close - ma5) / ma5 * 100
-    df['sma_5']          = ma5
-    df['sma_25']         = ma25
+    df['mavg_5_diff']     = (close - ma5) / ma5 * 100
+    df['sma_5']           = ma5
+    df['sma_25']          = ma25
 
-    df['turnover']       = close * volume
+    df['turnover']        = close * volume
     df['turnover_avg_20'] = df['turnover'].rolling(window=20).mean()
 
-    df['is_above_ma25']  = close > ma25
-    df['ma25_upward']    = ma25.diff() > 0
+    df['is_above_ma25']   = close > ma25
+    df['ma25_upward']     = ma25.diff() > 0
 
     delta = close.diff()
     gain  = delta.where(delta > 0, 0).rolling(window=14).mean()
@@ -220,7 +222,7 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
         - ③含み益がプラス
     """
     cfg = _load_config()
-    exit_cfg = cfg.get("exit_rules", {})
+    exit_cfg       = cfg.get("exit_rules", {})
     immediate_cfg  = exit_cfg.get("immediate", {})
     hold_days      = exit_cfg.get("hold_days", 10)
     trailing_cfg   = exit_cfg.get("trailing", {})
@@ -280,7 +282,6 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
                 else:
                     print(f"✅ {ticker}: 保有継続（{held_days}日目 / 含み益{pnl_pct:+.2f}%）")
             else:
-                # トレーリング無効時は期間満了で手じまい
                 exit_reason = f"⏰ 保有{held_days}日経過（期間満了）"
 
         if exit_reason:
@@ -323,8 +324,32 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
             print(f"🚨 market_breaker 発動: 日経先物 {market_change:+.2f}% → 本日のスキャンをスキップします")
             return []
 
+    # ★ フィルター1: JPXマスターに存在する銘柄のみを対象にする
+    jpx_tickers = None
+    try:
+        jpx_tickers = set(portfolio_manager.get_target_tickers().keys())
+        print(f"📋 JPXマスター有効銘柄数: {len(jpx_tickers)}")
+    except Exception as e:
+        print(f"⚠️ JPXマスター取得失敗（フィルタースキップ）: {e}")
+
+    # ★ フィルター2: オープンポジションがある銘柄を除外
+    db = database_manager.DBManager()
+    open_positions = db.load_open_positions()
+    open_tickers = set(open_positions["ticker"].tolist()) if not open_positions.empty else set()
+    if open_tickers:
+        print(f"📂 オープンポジション除外: {open_tickers}")
+
     all_hits = []
     for ticker, df_ticker in daily_data[daily_data["ticker"] != "NIY=F"].groupby("ticker"):
+
+        # JPXマスター除外チェック（上場廃止・整理・監理ポスト）
+        if jpx_tickers is not None and ticker not in jpx_tickers:
+            continue
+
+        # オープンポジション除外チェック（同じ銘柄の重複シグナル防止）
+        if ticker in open_tickers:
+            continue
+
         df_sorted = df_ticker.sort_values("date")
         hits = _check_signals(ticker, df_sorted, cfg)
         for h in hits:
