@@ -35,7 +35,7 @@ def _to_yf_ticker(code):
 # 銘柄マスター取得
 # -----------------------------------------------------------------------
 def get_target_tickers():
-    """JPXから最新の銘柄リストを取得。"""
+    """JPXから最新の銘柄リストを取得。整理・監理ポスト銘柄を除外。"""
     base_url = "https://www.jpx.co.jp"
     list_page = f"{base_url}/markets/statistics-equities/misc/01.html"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -45,24 +45,40 @@ def get_target_tickers():
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(res.text, "html.parser")
         link = soup.find("a", href=lambda x: x and "data_j.xls" in x)
-        
+
         if link:
             excel_url = base_url + link["href"]
             resp = requests.get(excel_url, headers=headers, timeout=30)
             df = pd.read_excel(io.BytesIO(resp.content))
-            
+
+            # ★ 整理・監理ポスト除外
+            EXCLUDE_MARKETS = [
+                "整理（内国株式）",
+                "監理（内国株式）",
+                "整理（外国株式）",
+                "監理（外国株式）",
+            ]
+            market_col = "市場・商品区分"
+            if market_col in df.columns:
+                before = len(df)
+                df = df[~df[market_col].isin(EXCLUDE_MARKETS)]
+                excluded = before - len(df)
+                if excluded > 0:
+                    print(f"⛔ 整理・監理ポスト除外: {excluded} 銘柄")
+
             stock_map = {}
             for _, row in df.iterrows():
                 code = str(row.iloc[1]).strip()
                 name = str(row.iloc[2]).strip()
                 if code.isdigit() and len(code) >= 4:
                     stock_map[f"{code[:4]}.T"] = {"name": name}
-            
-            print(f"✅ JPXマスター取得完了: {len(stock_map)} 銘柄")
+
+            print(f"✅ JPXマスター取得完了: {len(stock_map)} 銘柄（整理・監理ポスト除外済み）")
             return stock_map
+
     except Exception as e:
         print(f"⚠️ JPXマスター取得エラー (サンプルを使用します): {e}")
-    
+
     return {"7203.T": {"name": "トヨタ"}, "8306.T": {"name": "三菱UFJ"}}
 
 # -----------------------------------------------------------------------
