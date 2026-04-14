@@ -2,18 +2,21 @@
 # ==================
 # 戦略: トレンドフォロー・初動ブレイク狙い
 # ターゲット: 流動性の高い中大型株
+
 signals:
-  # ---- ① トレンド発生のトリガー（ゴールデンクロスを初動として利用） ----
+  # ---- ① トレンド発生のトリガー ----
   golden_cross:
     enabled: true
     short_window: 5
     long_window: 25
-  # ---- ② RSIによる「過熱感」のチェック ----
+
+  # ---- ② RSIによるチェック ----
   rsi_oversold:
     enabled: true
     window: 14
-    threshold: 50 
-  # ---- ③ 出来高による「裏付け」 ----
+    threshold: 40  # 50 -> 40 (本当の売られすぎに変更)
+
+  # ---- ③ 出来高による裏付け ----
   volume_surge:
     enabled: true
     window: 20
@@ -24,29 +27,25 @@ filter:
   max_price: 50000
   min_data_days: 80
   exclude_code_range:
-    - [1300, 1699] # 主要なETF/ETN
-    - [2000, 2099] # ETN
-    - [2500, 2639] # ETF
-    - [2840, 2859] # ETF
-    - [8950, 8999] # REIT
+    - [1300, 1699]  # 主要なETF/ETN
+    - [2000, 2099]  # ETN
+    - [2500, 2639]  # ETF
+    - [2840, 2859]  # ETF
+    - [8950, 8999]  # REIT
   min_daily_turnover_avg_20: 500000000
   max_signals_per_ticker: 1
-  # ==================================================
-  # ⑤ 市場全体の地合いフィルター（サーキットブレーカー）
-  # ==================================================
+
+  # 市場全体の地合いフィルター
   market_breaker:
     enabled: true
     symbol: "NIY=F"
     drop_threshold_pct: -1.5
-  # ==================================================
-  # ⑥ ストップ高フィルター（翌朝成り行きで買えない銘柄を除外）
-  # ==================================================
+
+  # ストップ高フィルター
   stop_high:
     enabled: true
 
-# ==================================================
-# ④ スコアリング（優先順位付け）のロジック実装定義
-# ==================================================
+# スコアリングロジック
 scoring_logic:
   enabled: true
   weights:
@@ -60,20 +59,24 @@ scoring_logic:
     turnover_ideal_min: 1000000000
     rsi_ideal_range: [40, 65]
 
-# ==================================================
-# ⑦ 手じまいロジック設定
-# ==================================================
+# 手じまいロジック設定
 exit_rules:
-  # 即時手じまい（保有日数に関わらず）
   immediate:
-    dead_cross: true          # デッドクロス発生
-    rsi_overbought: 70        # RSI過熱
-  # 通常手じまい（保有日数ベース）
+    dead_cross: true
+    rsi_overbought: 70
   hold_days: 10
-  # トレーリング（hold_days経過後の毎日判定）
   trailing:
     enabled: true
     conditions:
-      golden_cross_maintained: true  # 5日線 > 25日線を維持
-      rsi_below: 70                  # RSI70未満
-      profit_required: true          # 含み益がプラスであること
+      golden_cross_maintained: true
+      rsi_below: 70
+      profit_required: true
+
+# バックテストパラメータ
+backtest:
+  stop_loss_pct: 3.0          # 5.0 -> 3.0 (最大DD改善)
+  initial_capital: 1000000
+  position_size: 0.1
+  max_daily_entries: 3
+  market_crash_limit: -2.0
+  exclude_score_range: [80, 85]  # 80-84.9点帯を除外
