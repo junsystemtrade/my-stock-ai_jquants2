@@ -35,6 +35,8 @@ filter:
   min_daily_turnover_avg_20: 500000000
   max_signals_per_ticker: 1
 
+  require_above_ma25: true  # ← 追加
+　
   # 市場全体の地合いフィルター
   market_breaker:
     enabled: true
