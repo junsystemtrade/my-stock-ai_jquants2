@@ -1,14 +1,13 @@
 """
 signal_engine.py
-
+================
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
-手じまいシグナル判定・トレーリング・ストップ高除外機能を追加。
-JPXマスター除外・オープンポジション除外を追加。
 
 変更点:
-- scan_signals() での上場廃止除外を強化
-  「DBの最終日が前営業日から5日以上古い銘柄」を除外
-  → 上場廃止・長期停止銘柄が混入しなくなる
+  - scan_signals() の上場廃止フィルターを強化
+    JPXマスターに存在しない銘柄を確実に除外
+    かつ直近5営業日データがない銘柄も除外（廃止後DBに残るデータ対策）
+  - check_exit_signals() で entry_price=NULL のポジションをスキップ
 """
 
 import os
@@ -21,11 +20,8 @@ from sqlalchemy import text
 import database_manager
 import portfolio_manager
 
-# -------------------------------------------------------------------------
-# 設定の読み込み
-# -------------------------------------------------------------------------
-
 _CONFIG_PATH = Path(__file__).parent / "signals_config.yml"
+
 
 def _load_config() -> dict:
     if _CONFIG_PATH.exists():
@@ -38,65 +34,52 @@ def _load_config() -> dict:
             "volume_surge":  {"enabled": True, "window": 20, "multiplier": 2.0},
         },
         "filter": {
-            "min_price": 500,
-            "max_price": 50000,
-            "min_data_days": 80,
-            "min_daily_turnover_avg_20": 500000000,
-            "exclude_code_range": [[1000, 1999]],
-            "max_signals_per_ticker": 1,
+            "min_price": 500, "max_price": 50000,
+            "min_data_days": 80, "min_daily_turnover_avg_20": 500000000,
+            "exclude_code_range": [[1000, 1999]], "max_signals_per_ticker": 1,
         },
         "exit_rules": {
             "immediate": {"dead_cross": True, "rsi_overbought": 70},
             "hold_days": 10,
-            "trailing": {
-                "enabled": True,
-                "conditions": {
-                    "golden_cross_maintained": True,
-                    "rsi_below": 70,
-                    "profit_required": True,
-                }
-            }
+            "trailing": {"enabled": True, "conditions": {
+                "golden_cross_maintained": True, "rsi_below": 70, "profit_required": True,
+            }}
         }
     }
+
 
 def _today_jst():
     return datetime.now(ZoneInfo("Asia/Tokyo")).date()
 
-# -------------------------------------------------------------------------
-# 地合い判定
-# -------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# 地合い判定
+# -----------------------------------------------------------------------
 def _get_market_condition() -> tuple[float, str]:
-    """日経平均先物(NIY=F)の直近比較で地合いを判定"""
     db    = database_manager.DBManager()
-    query = text("""
-        SELECT price FROM daily_prices
-        WHERE ticker = 'NIY=F'
-        ORDER BY date DESC LIMIT 2
-    """)
+    query = text("SELECT price FROM daily_prices WHERE ticker = 'NIY=F' ORDER BY date DESC LIMIT 2")
     try:
         with db.engine.connect() as conn:
             df_niy = pd.read_sql(query, conn)
-            if len(df_niy) < 2:
-                return 0.0, "不明"
-            p_now    = float(df_niy["price"].iloc[0])
-            p_prev   = float(df_niy["price"].iloc[1])
-            m_change = (p_now - p_prev) / p_prev * 100
-            if m_change <= -2.0:    status = "暴落警戒"
-            elif m_change <= -0.5:  status = "軟調"
-            elif m_change >= 0.5:   status = "好調"
-            else:                   status = "平穏"
-            return round(m_change, 2), status
+        if len(df_niy) < 2:
+            return 0.0, "不明"
+        p_now    = float(df_niy["price"].iloc[0])
+        p_prev   = float(df_niy["price"].iloc[1])
+        m_change = (p_now - p_prev) / p_prev * 100
+        if m_change <= -2.0:    status = "暴落警戒"
+        elif m_change <= -0.5:  status = "軟調"
+        elif m_change >= 0.5:   status = "好調"
+        else:                   status = "平穏"
+        return round(m_change, 2), status
     except Exception as e:
-        print(f"⚠️ 地合い判定失敗: {e}")
+        print(f"WARNING market condition: {e}")
         return 0.0, "エラー"
 
-# -------------------------------------------------------------------------
-# ストップ高判定
-# -------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# ストップ高判定
+# -----------------------------------------------------------------------
 def _is_stop_high(price: float, prev_price: float) -> bool:
-    """東証ルールに基づきストップ高に達しているか判定する"""
     if prev_price <= 0:
         return False
     if prev_price < 100:       limit = 30
@@ -125,10 +108,10 @@ def _is_stop_high(price: float, prev_price: float) -> bool:
     else:                      limit = 200000
     return (price - prev_price) >= limit
 
-# -------------------------------------------------------------------------
-# 指標計算
-# -------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# 指標計算
+# -----------------------------------------------------------------------
 def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df     = df.copy()
     close  = df["price"].astype(float)
@@ -150,13 +133,12 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     gain  = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss  = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df["rsi_14"] = 100 - (100 / (1 + (gain / loss.replace(0, float("nan")))))
-
     return df
 
-# -------------------------------------------------------------------------
-# シグナル判定コア（買い）
-# -------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# シグナル判定コア
+# -----------------------------------------------------------------------
 def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     code_str = ticker.replace(".T", "").strip()
     if any(
@@ -175,13 +157,11 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     prev_row = df.iloc[-2] if len(df) >= 2 else None
     price    = float(row["price"])
 
-    # ストップ高チェック
     stop_high_cfg = cfg.get("filter", {}).get("stop_high", {})
     if stop_high_cfg.get("enabled", True) and prev_row is not None:
         if _is_stop_high(price, float(prev_row["price"])):
             return []
 
-    # フィルタ判定
     min_turnover = cfg["filter"].get("min_daily_turnover_avg_20", 500000000)
     if row["turnover_avg_20"] < min_turnover:
         return []
@@ -189,8 +169,8 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
         return []
 
     res   = []
-    sma_s = df["sma_5"]
-    sma_l = df["sma_25"]
+    sma_s = df["price"].rolling(window=5).mean()
+    sma_l = df["price"].rolling(window=25).mean()
     if len(sma_s) > 1 and sma_s.iloc[-2] <= sma_l.iloc[-2] and sma_s.iloc[-1] > sma_l.iloc[-1]:
         res.append({"signal_type": "ゴールデンクロス(短期)", "reason": "5日線が25日線を上抜け", "priority": 1})
 
@@ -207,24 +187,24 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     best.update({"ticker": ticker, "price": price, **row.to_dict()})
     return [best]
 
-# -------------------------------------------------------------------------
-# 手じまいシグナル判定
-# -------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# 手じまいシグナル判定
+# -----------------------------------------------------------------------
 def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
-    cfg           = _load_config()
-    exit_cfg      = cfg.get("exit_rules", {})
-    immediate_cfg = exit_cfg.get("immediate", {})
-    hold_days     = exit_cfg.get("hold_days", 10)
-    trailing_cfg  = exit_cfg.get("trailing", {})
-    trailing_on   = trailing_cfg.get("enabled", True)
-    trail_cond    = trailing_cfg.get("conditions", {})
+    cfg            = _load_config()
+    exit_cfg       = cfg.get("exit_rules", {})
+    immediate_cfg  = exit_cfg.get("immediate", {})
+    hold_days      = exit_cfg.get("hold_days", 10)
+    trailing_cfg   = exit_cfg.get("trailing", {})
+    trailing_on    = trailing_cfg.get("enabled", True)
+    trail_cond     = trailing_cfg.get("conditions", {})
     rsi_overbought = immediate_cfg.get("rsi_overbought", 70)
 
     db             = database_manager.DBManager()
     open_positions = db.load_open_positions()
     if open_positions.empty:
-        print("📂 オープンポジションなし")
+        print("INFO: no open positions")
         return []
 
     today        = daily_data["date"].max()
@@ -235,13 +215,13 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
         entry_date  = pd.to_datetime(pos["entry_date"]).date()
         entry_price = pos["entry_price"]
 
+        # entry_price が NULL（未確定）のポジションはスキップ
         if entry_price is None or pd.isna(entry_price):
-            print(f"⏭️ {ticker}: entry_price 未確定のためスキップ")
+            print(f"SKIP {ticker}: entry_price not set yet")
             continue
 
         entry_price = float(entry_price)
-
-        df_ticker = daily_data[daily_data["ticker"] == ticker].sort_values("date")
+        df_ticker   = daily_data[daily_data["ticker"] == ticker].sort_values("date")
         if df_ticker.empty or len(df_ticker) < 26:
             continue
 
@@ -260,9 +240,9 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
 
         if held_days < hold_days:
             if immediate_cfg.get("dead_cross", True) and is_dc:
-                exit_reason = "💀 デッドクロス発生"
+                exit_reason = "デッドクロス発生"
             elif rsi >= rsi_overbought:
-                exit_reason = f"🌡️ RSI過熱 ({rsi:.1f})"
+                exit_reason = f"RSI過熱 ({rsi:.1f})"
         else:
             if trailing_on:
                 reasons = []
@@ -273,11 +253,11 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
                 if trail_cond.get("profit_required", True) and pnl_pct <= 0:
                     reasons.append("含み損転落")
                 if reasons:
-                    exit_reason = f"📉 トレーリング手じまい（{' / '.join(reasons)}）"
+                    exit_reason = f"トレーリング手じまい（{' / '.join(reasons)}）"
                 else:
-                    print(f"✅ {ticker}: 保有継続（{held_days}日目 / 含み益{pnl_pct:+.2f}%）")
+                    print(f"OK {ticker}: hold ({held_days}days / {pnl_pct:+.2f}%)")
             else:
-                exit_reason = f"⏰ 保有{held_days}日経過（期間満了）"
+                exit_reason = f"保有{held_days}日経過"
 
         if exit_reason:
             exit_signals.append({
@@ -290,20 +270,17 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
                 "held_days":     held_days,
             })
             db.close_position(
-                ticker=ticker,
-                entry_date=entry_date,
-                close_reason=exit_reason,
-                closed_date=today,
-                exit_price=current_price,
+                ticker=ticker, entry_date=entry_date,
+                close_reason=exit_reason, closed_date=today, exit_price=current_price,
             )
 
-    print(f"🚨 手じまいシグナル: {len(exit_signals)} 件")
+    print(f"INFO exit signals: {len(exit_signals)}")
     return exit_signals
 
-# -------------------------------------------------------------------------
-# メインスキャン（買いシグナル）
-# -------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# メインスキャン（買いシグナル）
+# -----------------------------------------------------------------------
 def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[dict]:
     if daily_data.empty:
         return []
@@ -318,53 +295,56 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
     if breaker_cfg.get("enabled", False):
         threshold = breaker_cfg.get("drop_threshold_pct", -1.5)
         if market_change <= threshold:
-            print(f"🚨 market_breaker 発動: 日経先物 {market_change:+.2f}% → スキャンをスキップ")
+            print(f"WARNING market_breaker: {market_change:+.2f}% -> skip scan")
             return []
 
-    # ★ フィルター1: JPXマスターに存在する銘柄のみ（上場廃止除外）
-    jpx_tickers = None
+    # ---------------------------------------------------------------
+    # フィルター① JPXマスターに存在する銘柄のみ（上場廃止・整理・監理除外）
+    # ---------------------------------------------------------------
+    jpx_tickers = set()
     try:
         jpx_tickers = set(portfolio_manager.get_target_tickers().keys())
-        print(f"📋 JPXマスター有効銘柄数: {len(jpx_tickers)}")
+        print(f"INFO JPX tickers: {len(jpx_tickers)}")
     except Exception as e:
-        print(f"⚠️ JPXマスター取得失敗（フィルタースキップ）: {e}")
+        print(f"WARNING JPX fetch failed: {e}")
 
-    # ★ フィルター2: DBの最終日が前営業日から14日以上古い銘柄を除外
-    today          = _today_jst()
-    stale_cutoff   = today - timedelta(days=14)
-    latest_by_ticker = (
+    # ---------------------------------------------------------------
+    # フィルター② daily_data の最終日を確認して古い銘柄を除外
+    # 「DBの最大日付から5日以上離れている銘柄」= 上場廃止等でデータが途切れた銘柄
+    # ---------------------------------------------------------------
+    db_max_date = daily_data[daily_data["ticker"] != "NIY=F"]["date"].max()
+    stale_limit = pd.Timestamp(db_max_date) - pd.Timedelta(days=7)
+
+    latest_per_ticker = (
         daily_data[daily_data["ticker"] != "NIY=F"]
         .groupby("ticker")["date"]
         .max()
     )
-    active_tickers = set(
-        latest_by_ticker[
-            latest_by_ticker >= pd.Timestamp(stale_cutoff).date()
-        ].index
-    )
+    # DB全体の最終日から7日以上古い銘柄 = 上場廃止等とみなして除外
+    stale_tickers = set(latest_per_ticker[latest_per_ticker < stale_limit.date()].index)
+    if stale_tickers:
+        print(f"INFO stale tickers excluded (possibly delisted): {len(stale_tickers)}")
 
-    # ★ フィルター3: オープンポジションがある銘柄を除外
-    db             = database_manager.DBManager()
-    open_positions = db.load_open_positions()
-    open_tickers   = (
-        set(open_positions["ticker"].tolist())
-        if not open_positions.empty else set()
-    )
+    # ---------------------------------------------------------------
+    # フィルター③ オープンポジションがある銘柄を除外
+    # ---------------------------------------------------------------
+    open_positions = database_manager.DBManager().load_open_positions()
+    open_tickers   = set(open_positions["ticker"].tolist()) if not open_positions.empty else set()
     if open_tickers:
-        print(f"📂 オープンポジション除外: {open_tickers}")
+        print(f"INFO open position tickers excluded: {open_tickers}")
 
     all_hits = []
-    excluded_stale = 0
-
     for ticker, df_ticker in daily_data[daily_data["ticker"] != "NIY=F"].groupby("ticker"):
 
-        if jpx_tickers is not None and ticker not in jpx_tickers:
+        # ① JPXマスター除外
+        if jpx_tickers and ticker not in jpx_tickers:
             continue
 
-        if ticker not in active_tickers:
-            excluded_stale += 1
+        # ② 古データ除外（上場廃止銘柄がDBに残っているケース）
+        if ticker in stale_tickers:
             continue
 
+        # ③ オープンポジション除外
         if ticker in open_tickers:
             continue
 
@@ -373,8 +353,5 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
         for h in hits:
             h["market_status"] = market_status
             all_hits.append(h)
-
-    if excluded_stale > 0:
-        print(f"⛔ 古データ除外（上場廃止等）: {excluded_stale} 銘柄")
 
     return all_hits
