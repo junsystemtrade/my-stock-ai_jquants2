@@ -1,15 +1,11 @@
-# “””
+"""
 signal_engine.py
 
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
 
 変更点:
-
 - _check_signals() に require_above_ma25 フィルターを追加
-  signals_config.yml の filter.require_above_ma25: true の場合、
-  株価が25日移動平均線より上の銘柄のみエントリー対象にする
-  → 下落トレンド中の銘柄へのエントリーを防ぎストップロスを減らす
-  “””
+"""
 
 import os
 import yaml
