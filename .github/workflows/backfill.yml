@@ -1,14 +1,16 @@
 # .github/workflows/backfill.yml
 # =====================================
-# DBへの直近3年間株価データ格納のためのyml
-name: Initial Backfill (3 Years)
+# データベースへ過去3年間の株価データを格納・更新するためのワークフロー
+name: 🛠️ 月次データバックフィル (3年分更新)
+
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 手動実行用
   schedule:
-    - cron: "0 21 28 * *"  # 毎月28日 JST 06:00（UTC 21:00）に実行
+    - cron: "0 21 28 * *"  # 毎月28日 JST 06:00（UTC 21:00）に自動実行
 
 jobs:
   backfill:
+    name: 📊 過去データの収集と更新
     runs-on: ubuntu-latest
     timeout-minutes: 340
     env:
@@ -19,28 +21,33 @@ jobs:
       YF_CHUNK_SIZE:       "50"
       YF_SLEEP_SEC:        "3.0"
       DB_CHUNK_SIZE:       "1000"
+
     steps:
-      - name: Checkout
+      - name: 📥 リポジトリをチェックアウト
         uses: actions/checkout@v4
-      - name: Setup Python
+
+      - name: 🐍 Pythonセットアップ
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: Install dependencies
+
+      - name: 📦 依存ライブラリのインストール
         run: pip install -r requirements.txt
-      - name: Run backfill
+
+      - name: 🚀 バックフィル処理を実行
         run: python portfolio_manager.py
-      - name: Notify Discord
+
+      - name: 🔔 Discord通知
         if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           STATUS="${{ job.status }}"
           if [ "$STATUS" = "success" ]; then
-            MSG="✅ 月次バックフィル完了（毎月28日定期実行）"
+            MSG="✅ **月次バックフィル完了**\n過去3年分の株価データ更新が正常に終了しました。（毎月28日 定期実行）"
           else
-            MSG="❌ 月次バックフィル失敗。手動で再実行してください。"
+            MSG="❌ **月次バックフィル失敗**\n処理中にエラーが発生しました。ログを確認し、必要に応じて手動で再実行してください。"
           fi
           curl -s -X POST "$DISCORD_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
