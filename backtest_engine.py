@@ -2,12 +2,8 @@
 backtest_engine.py
 ==================
 市場環境（地合い）とスコアリングを用いた精鋭選別バックテスト。
-トレーリング保有延長・ストップ高除外に対応。
+高速化対応・トレーリング保有延長・ストップ高除外に対応。
 RSI過熱の集計を正規化し、通知を2000文字以内に収める。
-
-変更点:
-  - stop_loss_pct: 5.0 -> 3.0 (signals_config.ymlで設定)
-  - exclude_score_range: [80, 85] で80-84.9点帯を除外
 """
 
 import os
@@ -15,6 +11,7 @@ import re
 import requests
 import pandas as pd
 from google import genai
+from datetime import datetime
 
 from database_manager import DBManager
 from signal_engine import _check_signals, _load_config, _is_stop_high, _calculate_indicators
@@ -24,11 +21,12 @@ from scoring_system import calculate_score
 # バックテストパラメータ
 # -----------------------------------------------------------------------
 _DEFAULT_BT_PARAMS = {
-    "stop_loss_pct":       5.0,
+    "stop_loss_pct":       3.0,
     "initial_capital":     1_000_000,
     "position_size":       0.1,
     "max_daily_entries":   3,
     "market_crash_limit":  -2.0,
+    "exclude_score_range": [80, 85],
 }
 
 def _load_bt_params() -> dict:
@@ -290,7 +288,9 @@ def _send_discord(content: str):
 # メイン実行
 # -----------------------------------------------------------------------
 def run_backtest_and_report():
-    print("📊 バックテスト開始（トレーリングモード）...")
+    start_time = datetime.now()
+    print(f"📊 バックテスト開始（高速化・トレーリングモード）: {start_time.strftime('%H:%M:%S')}")
+    
     cfg       = _load_config()
     bt_params = _load_bt_params()
 
@@ -300,10 +300,12 @@ def run_backtest_and_report():
         print(f"  除外スコア帯: {excl[0]}〜{excl[1]-0.1:.1f}点")
 
     db     = DBManager()
+    # データを一括ロード
     df_all = db.load_analysis_data(days=365 * 3)
     if df_all.empty:
         return
 
+    # 地合いデータの分離とハッシュ化（高速化）
     niy_df = df_all[df_all["ticker"] == "NIY=F"].sort_values("date").copy()
     niy_df["m_change"] = niy_df["price"].pct_change() * 100
     crash_dates = set(niy_df[niy_df["m_change"] <= bt_params["market_crash_limit"]]["date"])
@@ -311,7 +313,12 @@ def run_backtest_and_report():
     all_signals = []
     tickers     = [t for t in df_all["ticker"].unique() if t != "NIY=F"]
     min_days    = cfg.get("filter", {}).get("min_data_days", 80)
+    stop_high_enabled = cfg.get("filter", {}).get("stop_high", {}).get("enabled", True)
+    scoring_cfg = cfg.get("scoring_logic", {})
 
+    print(f"  解析対象銘柄数: {len(tickers)}")
+
+    # 銘柄ごとに一括処理（高速化の核心）
     for ticker in tickers:
         df_ticker = (
             df_all[df_all["ticker"] == ticker]
@@ -321,29 +328,33 @@ def run_backtest_and_report():
         if len(df_ticker) < min_days:
             continue
 
+        # 指標計算を1銘柄につき1回に集約（高速化）
         df_ticker = _calculate_indicators(df_ticker)
 
+        # 日次ループ
         for i in range(min_days, len(df_ticker) - 1):
+            row_curr = df_ticker.iloc[i]
             entry_date = df_ticker.iloc[i + 1]["date"]
+            
+            # 1. 地合いチェック
             if entry_date in crash_dates:
                 continue
 
-            stop_high_cfg = cfg.get("filter", {}).get("stop_high", {})
-            if stop_high_cfg.get("enabled", True) and i >= 1:
-                curr_p = float(df_ticker.iloc[i]["price"])
-                prev_p = float(df_ticker.iloc[i - 1]["price"])
-                if _is_stop_high(curr_p, prev_p):
+            # 2. ストップ高チェック
+            if stop_high_enabled and i >= 1:
+                if _is_stop_high(float(row_curr["price"]), float(df_ticker.iloc[i - 1]["price"])):
                     continue
 
+            # 3. シグナル判定
+            # ヒント：_check_signals内部で重複計算を避けるよう実装されていることが前提
             hits = _check_signals(ticker, df_ticker.iloc[: i + 1], cfg)
             if not hits:
                 continue
 
-            score = calculate_score(
-                pd.Series(hits[0]), cfg.get("scoring_logic", {})
-            )
+            # 4. スコアリング
+            score = calculate_score(pd.Series(hits[0]), scoring_cfg)
 
-            # 80〜84.9点帯を除外
+            # 5. スコア除外
             if _is_score_excluded(score, bt_params):
                 continue
 
@@ -352,7 +363,7 @@ def run_backtest_and_report():
                 "ticker":      ticker,
                 "score":       score,
                 "signal_type": hits[0]["signal_type"],
-                "df_ticker":   df_ticker,
+                "df_ticker":   df_ticker, # 同一銘柄内では参照渡し
                 "entry_idx":   i + 1,
             })
 
@@ -360,6 +371,7 @@ def run_backtest_and_report():
         print("シグナルが検出されませんでした。")
         return
 
+    # 資金管理・エントリー選択
     sig_df   = pd.DataFrame(all_signals)
     selected = (
         sig_df
@@ -370,25 +382,32 @@ def run_backtest_and_report():
 
     final_trades, free_dates = [], {}
 
+    # トレード実行
     for _, sig in selected.iterrows():
         ticker = sig["ticker"]
+        # 保有中の再エントリー禁止
         if ticker in free_dates and sig["date"] < pd.to_datetime(free_dates[ticker]):
             continue
+            
         trade = _execute_trade(sig, bt_params, cfg)
         if trade:
             final_trades.append(trade)
             free_dates[ticker] = trade["exit_date"]
 
+    # レポート作成と通知
     if final_trades:
         summary = _calc_summary(final_trades, bt_params)
-        report  = _format_report_with_gemini(
-            summary,
-            sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True)
-        )
+        top_trades = sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True)
+        report = _format_report_with_gemini(summary, top_trades)
+        
         _send_discord(f"📈 **精鋭バックテストレポート（トレーリングモード）**\n{report}")
         print(_format_report_plain(summary))
     else:
         print("有効なトレードがありませんでした。")
+    
+    end_time = datetime.now()
+    duration = end_time - start_time
+    print(f"📊 バックテスト完了。所要時間: {duration}")
 
 
 if __name__ == "__main__":
