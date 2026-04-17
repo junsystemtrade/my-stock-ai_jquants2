@@ -211,6 +211,8 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     trailing_on    = trailing_cfg.get("enabled", True)
     trail_cond     = trailing_cfg.get("conditions", {})
     rsi_overbought = immediate_cfg.get("rsi_overbought", 70)
+    # 実運用用の損切り設定を取得
+    stop_loss_limit = exit_cfg.get("stop_loss_pct")
 
     db             = database_manager.DBManager()
     open_positions = db.load_open_positions()
@@ -248,11 +250,18 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
         rsi         = float(row["rsi_14"])
         exit_reason = None
 
-        if held_days < hold_days:
+        # 1. 損切り判定を最優先（バックテストと同期）
+        if stop_loss_limit and pnl_pct <= -stop_loss_limit:
+            exit_reason = f"固定損切り到達 ({pnl_pct:.2f}%)"
+
+        # 2. 短期保有期間中の判定
+        elif held_days < hold_days:
             if immediate_cfg.get("dead_cross", True) and is_dc:
                 exit_reason = "デッドクロス発生"
             elif rsi >= rsi_overbought:
                 exit_reason = f"RSI過熱 ({rsi:.1f})"
+        
+        # 3. 長期保有・トレーリング判定
         else:
             if trailing_on:
                 reasons = []
