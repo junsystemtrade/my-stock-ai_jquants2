@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 360
 
     env:
-    　FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       DATABASE_URL:        ${{ secrets.DATABASE_URL }}
       JQUANTS_API_KEY:     ${{ secrets.JQUANTS_API_KEY }}
       GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
