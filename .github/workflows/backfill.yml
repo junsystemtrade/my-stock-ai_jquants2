@@ -10,7 +10,7 @@ on:
 
 jobs:
   backfill:
-    name: 📊 過去データの収集と更新
+    name: Initial Backfill (3 Years)
     runs-on: ubuntu-latest
     timeout-minutes: 340
     env:
