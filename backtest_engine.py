@@ -26,7 +26,6 @@ _DEFAULT_BT_PARAMS = {
     "position_size":       0.1,
     "max_daily_entries":   3,
     "market_crash_limit":  -2.0,
-    "exclude_score_range": [80, 85],
 }
 
 def _load_bt_params() -> dict:
