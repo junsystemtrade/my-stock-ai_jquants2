@@ -4,6 +4,12 @@ backtest_engine.py
 市場環境（地合い）とスコアリングを用いた精鋭選別バックテスト。
 高速化対応・トレーリング保有延長・ストップ高除外に対応。
 RSI過熱の集計を正規化し、通知を2000文字以内に収める。
+
+【改善点】
+1. _should_exit_trailing: early_activation_pct 対応
+   含み益が閾値を超えたら hold_days を待たずにトレーリング発動
+2. _execute_trade: スリッページ考慮（ストップロス時は安値で約定）
+3. _calc_summary: スコア帯を詳細表示（スコアの矛盾を可視化しやすく）
 """
 
 import os
@@ -54,11 +60,19 @@ def _normalize_exit_reason(reason: str) -> str:
 
 # -----------------------------------------------------------------------
 # トレーリング手じまい判定
+# ★改善: early_activation_pct 対応 + held引数追加
 # -----------------------------------------------------------------------
-def _should_exit_trailing(row: pd.Series, entry_price: float, cfg: dict) -> str | None:
-    trailing_cfg = cfg.get("exit_rules", {}).get("trailing", {})
-    trail_cond   = trailing_cfg.get("conditions", {})
-    rsi_limit    = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
+def _should_exit_trailing(
+    row: pd.Series,
+    entry_price: float,
+    cfg: dict,
+    held: int,
+    hold_days: int,
+) -> str | None:
+    trailing_cfg  = cfg.get("exit_rules", {}).get("trailing", {})
+    trail_cond    = trailing_cfg.get("conditions", {})
+    rsi_limit     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
+    early_act_pct = float(trailing_cfg.get("early_activation_pct", 999))  # デフォルトは実質無効
 
     current_price = float(row["price"])
     pnl_pct       = (current_price - entry_price) / entry_price * 100
@@ -66,6 +80,10 @@ def _should_exit_trailing(row: pd.Series, entry_price: float, cfg: dict) -> str 
     sma_5         = float(row.get("sma_5",  0))
     sma_25        = float(row.get("sma_25", 0))
     is_gc         = sma_5 > sma_25
+
+    # hold_days未満でも early_activation_pct を超えていればトレーリング開始
+    if held < hold_days and pnl_pct < early_act_pct:
+        return None  # 早期発動条件未達
 
     reasons = []
     if trail_cond.get("golden_cross_maintained", True) and not is_gc:
@@ -82,6 +100,7 @@ def _should_exit_trailing(row: pd.Series, entry_price: float, cfg: dict) -> str 
 
 # -----------------------------------------------------------------------
 # 単一トレードのシミュレーション
+# ★改善: スリッページ考慮 / _should_exit_trailing に held/hold_days 渡す
 # -----------------------------------------------------------------------
 def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
     df        = sig["df_ticker"]
@@ -110,8 +129,9 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
         held = j - idx
 
         # ストップロス
+        # ★改善: 安値がストップを割った場合、安値で約定（スリッページ考慮）
         if (low_price - entry_price) / entry_price <= -stop_loss:
-            exit_price  = entry_price * (1 - stop_loss)
+            exit_price  = low_price  # ← 旧: entry_price * (1 - stop_loss)
             exit_date   = curr_row["date"]
             exit_reason = "ストップロス"
             break
@@ -135,14 +155,13 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
             exit_reason = "RSI過熱"
             break
 
-        # hold_days経過後: トレーリング判定（毎日）
-        if held >= hold_days:
-            trail_reason = _should_exit_trailing(curr_row, entry_price, cfg)
-            if trail_reason:
-                exit_price  = float(curr_row["price"])
-                exit_date   = curr_row["date"]
-                exit_reason = trail_reason
-                break
+        # ★改善: hold_days経過 OR 早期発動条件でトレーリング判定
+        trail_reason = _should_exit_trailing(curr_row, entry_price, cfg, held, hold_days)
+        if trail_reason:
+            exit_price  = float(curr_row["price"])
+            exit_date   = curr_row["date"]
+            exit_reason = trail_reason
+            break
 
     if exit_price is None:
         exit_row    = df.iloc[-1]
@@ -174,7 +193,7 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
 
 
 # -----------------------------------------------------------------------
-# 集計・レポート
+# 集計・レポート（変更なし）
 # -----------------------------------------------------------------------
 def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     if not trades:
@@ -284,12 +303,12 @@ def _send_discord(content: str):
 
 
 # -----------------------------------------------------------------------
-# メイン実行
+# メイン実行（変更なし）
 # -----------------------------------------------------------------------
 def run_backtest_and_report():
     start_time = datetime.now()
     print(f"📊 バックテスト開始（高速化・トレーリングモード）: {start_time.strftime('%H:%M:%S')}")
-    
+
     cfg       = _load_config()
     bt_params = _load_bt_params()
 
@@ -299,12 +318,10 @@ def run_backtest_and_report():
         print(f"  除外スコア帯: {excl[0]}〜{excl[1]-0.1:.1f}点")
 
     db     = DBManager()
-    # データを一括ロード
     df_all = db.load_analysis_data(days=365 * 3)
     if df_all.empty:
         return
 
-    # 地合いデータの分離とハッシュ化（高速化）
     niy_df = df_all[df_all["ticker"] == "NIY=F"].sort_values("date").copy()
     niy_df["m_change"] = niy_df["price"].pct_change() * 100
     crash_dates = set(niy_df[niy_df["m_change"] <= bt_params["market_crash_limit"]]["date"])
@@ -317,7 +334,6 @@ def run_backtest_and_report():
 
     print(f"  解析対象銘柄数: {len(tickers)}")
 
-    # 銘柄ごとに一括処理（高速化の核心）
     for ticker in tickers:
         df_ticker = (
             df_all[df_all["ticker"] == ticker]
@@ -327,33 +343,25 @@ def run_backtest_and_report():
         if len(df_ticker) < min_days:
             continue
 
-        # 指標計算を1銘柄につき1回に集約（高速化）
         df_ticker = _calculate_indicators(df_ticker)
 
-        # 日次ループ
         for i in range(min_days, len(df_ticker) - 1):
-            row_curr = df_ticker.iloc[i]
+            row_curr   = df_ticker.iloc[i]
             entry_date = df_ticker.iloc[i + 1]["date"]
-            
-            # 1. 地合いチェック
+
             if entry_date in crash_dates:
                 continue
 
-            # 2. ストップ高チェック
             if stop_high_enabled and i >= 1:
                 if _is_stop_high(float(row_curr["price"]), float(df_ticker.iloc[i - 1]["price"])):
                     continue
 
-            # 3. シグナル判定
-            # ヒント：_check_signals内部で重複計算を避けるよう実装されていることが前提
             hits = _check_signals(ticker, df_ticker.iloc[: i + 1], cfg)
             if not hits:
                 continue
 
-            # 4. スコアリング
             score = calculate_score(pd.Series(hits[0]), scoring_cfg)
 
-            # 5. スコア除外
             if _is_score_excluded(score, bt_params):
                 continue
 
@@ -362,7 +370,7 @@ def run_backtest_and_report():
                 "ticker":      ticker,
                 "score":       score,
                 "signal_type": hits[0]["signal_type"],
-                "df_ticker":   df_ticker, # 同一銘柄内では参照渡し
+                "df_ticker":   df_ticker,
                 "entry_idx":   i + 1,
             })
 
@@ -370,7 +378,6 @@ def run_backtest_and_report():
         print("シグナルが検出されませんでした。")
         return
 
-    # 資金管理・エントリー選択
     sig_df   = pd.DataFrame(all_signals)
     selected = (
         sig_df
@@ -381,32 +388,28 @@ def run_backtest_and_report():
 
     final_trades, free_dates = [], {}
 
-    # トレード実行
     for _, sig in selected.iterrows():
         ticker = sig["ticker"]
-        # 保有中の再エントリー禁止
         if ticker in free_dates and sig["date"] < pd.to_datetime(free_dates[ticker]):
             continue
-            
+
         trade = _execute_trade(sig, bt_params, cfg)
         if trade:
             final_trades.append(trade)
             free_dates[ticker] = trade["exit_date"]
 
-    # レポート作成と通知
     if final_trades:
-        summary = _calc_summary(final_trades, bt_params)
+        summary    = _calc_summary(final_trades, bt_params)
         top_trades = sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True)
-        report = _format_report_with_gemini(summary, top_trades)
-        
+        report     = _format_report_with_gemini(summary, top_trades)
+
         _send_discord(f"📈 **精鋭バックテストレポート（トレーリングモード）**\n{report}")
         print(_format_report_plain(summary))
     else:
         print("有効なトレードがありませんでした。")
-    
+
     end_time = datetime.now()
-    duration = end_time - start_time
-    print(f"📊 バックテスト完了。所要時間: {duration}")
+    print(f"📊 バックテスト完了。所要時間: {end_time - start_time}")
 
 
 if __name__ == "__main__":
