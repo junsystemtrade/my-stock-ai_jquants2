@@ -1,7 +1,7 @@
 # .github/workflows/backfill.yml
 # =====================================
 # データベースへ過去3年間の株価データを格納・更新するためのワークフロー
-name: 🛠️ 月次データバックフィル (3年分更新)
+name: Initial Backfill (3 Years)
 
 on:
   workflow_dispatch: # 手動実行用
