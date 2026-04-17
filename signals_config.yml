@@ -81,4 +81,3 @@ backtest:
   position_size: 0.1
   max_daily_entries: 3
   market_crash_limit: -2.0
-  exclude_score_range: [80, 85]  # 80-84.9点帯を除外
