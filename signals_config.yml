@@ -28,6 +28,9 @@ signals:
     enabled: true
     window: 20
     multiplier: 3.0
+    require_rsi_range: true   # ← 追加
+    rsi_min: 40               # ← 追加
+    rsi_max: 65               # ← 追加
 
 filter:
   min_price: 500
