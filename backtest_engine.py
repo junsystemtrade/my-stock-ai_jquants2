@@ -11,6 +11,10 @@ RSI過熱の集計を正規化し、通知を2000文字以内に収める。
               （ストップロス・RSI過熱・デッドクロス・トレーリング全て同じ）
 - 手じまい約定: 判定成立の翌日始値（open）で約定
 - データ末尾  : 最終日の始値で約定
+
+【改善】
+- _calc_summary にシグナル種別分析を追加
+- exclude_score_range を無効化（全スコア帯を出力）
 """
 
 import os
@@ -38,23 +42,14 @@ _DEFAULT_BT_PARAMS = {
 def _load_bt_params() -> dict:
     cfg = _load_config()
     bt  = cfg.get("backtest", {})
-    return {**_DEFAULT_BT_PARAMS, **bt}
-
-
-# -----------------------------------------------------------------------
-# スコア除外判定
-# -----------------------------------------------------------------------
-def _is_score_excluded(score: float, bt_params: dict) -> bool:
-    excl = bt_params.get("exclude_score_range")
-    if excl and len(excl) == 2:
-        if excl[0] <= score < excl[1]:
-            return True
-    return False
+    params = {**_DEFAULT_BT_PARAMS, **bt}
+    # exclude_score_range を強制無効化
+    params.pop("exclude_score_range", None)
+    return params
 
 
 # -----------------------------------------------------------------------
 # 始値取得ヘルパー
-# open カラムが存在しない・NaN・0 の場合は price（終値）にフォールバック
 # -----------------------------------------------------------------------
 def _get_open(row: pd.Series) -> float:
     o = row.get("open")
@@ -71,8 +66,7 @@ def _normalize_exit_reason(reason: str) -> str:
 
 
 # -----------------------------------------------------------------------
-# トレーリング手じまい判定（終値ベースで条件チェック）
-# 戻り値: (triggered: bool, reasons: list[str])
+# トレーリング手じまい判定
 # -----------------------------------------------------------------------
 def _should_exit_trailing(
     row: pd.Series,
@@ -86,14 +80,13 @@ def _should_exit_trailing(
     rsi_limit     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
     early_act_pct = float(trailing_cfg.get("early_activation_pct", 999))
 
-    current_price = float(row["price"])  # 終値で判定
+    current_price = float(row["price"])
     pnl_pct       = (current_price - entry_price) / entry_price * 100
     rsi           = float(row.get("rsi_14", 50))
     sma_5         = float(row.get("sma_5",  0))
     sma_25        = float(row.get("sma_25", 0))
     is_gc         = sma_5 > sma_25
 
-    # hold_days未満かつ早期発動条件未達 → スキップ
     if held < hold_days and pnl_pct < early_act_pct:
         return False, []
 
@@ -110,14 +103,6 @@ def _should_exit_trailing(
 
 # -----------------------------------------------------------------------
 # 単一トレードのシミュレーション
-#
-# 【全手じまい共通ルール】
-#   j日: 終値ベースで全条件判定 → pending_exit にセット
-#   j+1日: pending_exit があれば翌日始値で約定
-#
-#   ストップロスも同様:
-#     j日終値が entry_price × (1 - stop_loss) 以下 → pending_exit = "ストップロス"
-#     j+1日始値で約定
 # -----------------------------------------------------------------------
 def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
     df        = sig["df_ticker"]
@@ -125,28 +110,27 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
     stop_loss = bt_params["stop_loss_pct"] / 100
     hold_days = cfg.get("exit_rules", {}).get("hold_days", 10)
 
-    # ── エントリー（シグナル翌日始値） ────────────────────────────
     entry_row   = df.iloc[idx]
     entry_price = _get_open(entry_row)
     if entry_price <= 0:
         return None
 
     exit_price, exit_date, exit_reason = None, None, None
-    pending_exit = None  # 翌日始値で約定待ちの手じまい理由
+    pending_exit = None
 
     for j in range(idx + 1, len(df)):
         curr_row = df.iloc[j]
-        held     = j - idx  # 保有日数（エントリー翌日=1）
+        held     = j - idx
 
-        # ── ① 前日に条件成立 → 本日始値で約定 ────────────────────
+        # ① 前日に条件成立 → 本日始値で約定
         if pending_exit is not None:
             exit_price  = _get_open(curr_row)
             exit_date   = curr_row["date"]
             exit_reason = pending_exit
             break
 
-        # ── ② 当日終値ベースで全手じまい条件を判定 ────────────────
-        close_price = float(curr_row["price"])
+        # ② 当日終値ベースで全手じまい条件を判定
+        close_price   = float(curr_row["price"])
         pnl_pct_close = (close_price - entry_price) / entry_price * 100
 
         sma_s_prev = float(df.iloc[j-1].get("sma_5",  0)) if j > 0 else 0
@@ -158,24 +142,19 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
 
         is_dc = sma_s_prev >= sma_l_prev and sma_s_curr < sma_l_curr
 
-        # ストップロス（終値が-3%以下）
-        if pnl_pct_close <= -stop_loss * 100:
+        if pnl_pct_close <= -(stop_loss * 100):
             pending_exit = "ストップロス"
-        # デッドクロス
         elif is_dc:
             pending_exit = "デッドクロス"
-        # RSI過熱
         elif rsi_curr >= rsi_ob:
             pending_exit = "RSI過熱"
         else:
-            # トレーリング判定
             triggered, reasons = _should_exit_trailing(
                 curr_row, entry_price, cfg, held, hold_days
             )
             if triggered:
                 pending_exit = f"トレーリング手じまい（{' / '.join(reasons)}）"
 
-    # ── データ末尾（最終日始値で約定） ────────────────────────────
     if exit_price is None:
         last_row    = df.iloc[-1]
         exit_price  = _get_open(last_row)
@@ -212,6 +191,7 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     df["score_bin"] = (df["score"] // 5) * 5
     df["exit_reason_normalized"] = df["exit_reason"].apply(_normalize_exit_reason)
 
+    # スコア帯別集計
     score_stats = {}
     for bin_val, group in df.groupby("score_bin"):
         wins         = group[group["pnl_pct"] > 0]
@@ -223,6 +203,22 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
             "win_rate":   round(len(wins) / len(group) * 100, 1),
             "avg_return": round(group["pnl_pct"].mean(), 2),
             "avg_held":   round(group["held_days"].mean(), 1),
+            "pf":         round(gross_profit / gross_loss, 2),
+        }
+
+    # ★NEW: シグナル種別集計
+    signal_stats = {}
+    for sig_type, group in df.groupby("signal_type"):
+        wins         = group[group["pnl_pct"] > 0]
+        losses       = group[group["pnl_pct"] <= 0]
+        gross_profit = wins["pnl_yen"].sum()
+        gross_loss   = abs(losses["pnl_yen"].sum()) or 1e-9
+        signal_stats[sig_type] = {
+            "count":      len(group),
+            "win_rate":   round(len(wins) / len(group) * 100, 1),
+            "avg_return": round(group["pnl_pct"].mean(), 2),
+            "avg_held":   round(group["held_days"].mean(), 1),
+            "total_pnl":  round(group["pnl_yen"].sum(), 0),
             "pf":         round(gross_profit / gross_loss, 2),
         }
 
@@ -244,6 +240,7 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
         "profit_factor":    round(gross_profit / gross_loss, 2),
         "exit_counts":      exit_counts,
         "score_analysis":   score_stats,
+        "signal_analysis":  signal_stats,  # ★NEW
     }
 
 
@@ -261,11 +258,23 @@ def _format_report_plain(summary: dict) -> str:
     score_str += "─" * 40 + "\n"
     for bin_val, v in sorted(
         summary.get("score_analysis", {}).items(), key=lambda x: x[0], reverse=True
-    )[:10]:
+    ):
         label = f"{bin_val:2.0f}-{bin_val+4.9:4.1f}点"
         score_str += (
             f"{label}: {v['count']:>3}回 | 勝率{v['win_rate']:>5}% | "
             f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | PF:{v['pf']:>4.2f}\n"
+        )
+
+    # ★NEW: シグナル種別レポート
+    signal_str = "\n【シグナル種別分析】\n"
+    signal_str += "─" * 40 + "\n"
+    for sig_type, v in sorted(
+        summary.get("signal_analysis", {}).items(), key=lambda x: -x[1]["total_pnl"]
+    ):
+        signal_str += (
+            f"{sig_type}: {v['count']:>4}回 | 勝率{v['win_rate']:>5}% | "
+            f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | "
+            f"PF:{v['pf']:>4.2f} | 合計{v['total_pnl']:>+10,.0f}円\n"
         )
 
     return (
@@ -275,6 +284,7 @@ def _format_report_plain(summary: dict) -> str:
         f"合計: {summary['total_pnl_yen']:+,.0f}円\n"
         f"PF: {summary['profit_factor']} / 最大DD: {summary['max_drawdown_pct']}%\n"
         f"{exit_str}"
+        f"{signal_str}"
         f"{score_str}"
     )
 
@@ -285,8 +295,8 @@ def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
         return _format_report_plain(summary)
     client = genai.Client(api_key=api_key)
     prompt = (
-        "日本株バックテスト結果です。始値統一・トレーリング保有延長を導入した結果として、"
-        "スコア帯・手じまい理由・平均保有日数の観点から改善案を300字以内で要約してください。\n\n"
+        "日本株バックテスト結果です。シグナル種別・スコア帯・手じまい理由の観点から"
+        "改善案を300字以内で要約してください。\n\n"
         f"結果:\n{summary}\n\n上位トレード:\n{top_trades[:3]}"
     )
     try:
@@ -321,10 +331,8 @@ def run_backtest_and_report():
     cfg       = _load_config()
     bt_params = _load_bt_params()
 
-    excl = bt_params.get("exclude_score_range")
     print(f"  ストップロス: {bt_params['stop_loss_pct']}%")
-    if excl:
-        print(f"  除外スコア帯: {excl[0]}〜{excl[1]-0.1:.1f}点")
+    print(f"  スコア除外: なし（全帯出力）")
 
     db     = DBManager()
     df_all = db.load_analysis_data(days=365 * 3)
@@ -370,9 +378,6 @@ def run_backtest_and_report():
                 continue
 
             score = calculate_score(pd.Series(hits[0]), scoring_cfg)
-
-            if _is_score_excluded(score, bt_params):
-                continue
 
             all_signals.append({
                 "date":        pd.to_datetime(entry_date),
