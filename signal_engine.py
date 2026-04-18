@@ -3,11 +3,12 @@ signal_engine.py
 
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
 
-変更点:
-- _check_signals() に require_above_ma25 フィルターを追加
-  signals_config.yml の filter.require_above_ma25: true の場合、
-  株価が25日移動平均線より上の銘柄のみエントリー対象にする
-  → 下落トレンド中の銘柄へのエントリーを防ぎストップロスを減らす
+【改善内容】
+- golden_cross に volume_confirm オプションを追加
+  volume_confirm: true の場合、GC発生時に出来高が volume_confirm_ratio 倍以上
+  であることを条件に加える（出来高の裏付けのないGCを除外）
+- rsi_oversold は enabled: false で無効化対応済み
+- volume_surge の multiplier は YAML設定値を使用（3.0倍に変更済み）
 """
 
 import os
@@ -20,7 +21,6 @@ from sqlalchemy import text
 import database_manager
 import portfolio_manager
 
-# __file__ はアンダースコア2つ、引用符は半角
 _CONFIG_PATH = Path(__file__).parent / "signals_config.yml"
 
 def _load_config() -> dict:
@@ -30,8 +30,8 @@ def _load_config() -> dict:
     return {
         "signals": {
             "golden_cross": {"enabled": True, "short_window": 5, "long_window": 25},
-            "rsi_oversold":  {"enabled": True, "window": 14, "threshold": 40},
-            "volume_surge":  {"enabled": True, "window": 20, "multiplier": 2.0},
+            "rsi_oversold":  {"enabled": False, "window": 14, "threshold": 40},
+            "volume_surge":  {"enabled": True, "window": 20, "multiplier": 3.0},
         },
         "filter": {
             "min_price": 500, "max_price": 50000,
@@ -179,17 +179,47 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
         if not bool(row.get("is_above_ma25", False)):
             return []
 
-    res   = []
-    sma_s = df["sma_5"]
-    sma_l = df["sma_25"]
-    if len(sma_s) > 1 and sma_s.iloc[-2] <= sma_l.iloc[-2] and sma_s.iloc[-1] > sma_l.iloc[-1]:
-        res.append({"signal_type": "ゴールデンクロス(短期)", "reason": "5日線が25日線を上抜け", "priority": 1})
+    res    = []
+    sma_s  = df["sma_5"]
+    sma_l  = df["sma_25"]
+    gc_cfg = cfg["signals"].get("golden_cross", {})
+    vs_cfg = cfg["signals"].get("volume_surge", {})
+    ri_cfg = cfg["signals"].get("rsi_oversold", {})
 
-    if row["rsi_14"] < cfg["signals"]["rsi_oversold"]["threshold"]:
-        res.append({"signal_type": "RSI中立以下", "reason": f"RSI: {row['rsi_14']:.1f}", "priority": 2})
+    # ---- ① ゴールデンクロス ----
+    if gc_cfg.get("enabled", True):
+        is_gc = sma_s.iloc[-2] <= sma_l.iloc[-2] and sma_s.iloc[-1] > sma_l.iloc[-1]
+        if is_gc:
+            # volume_confirm オプション
+            volume_ok = True
+            if gc_cfg.get("volume_confirm", False):
+                confirm_ratio = float(gc_cfg.get("volume_confirm_ratio", 1.5))
+                volume_ok = float(row.get("volume_ratio", 0)) >= confirm_ratio
+            if volume_ok:
+                res.append({
+                    "signal_type": "ゴールデンクロス(短期)",
+                    "reason":      "5日線が25日線を上抜け（出来高確認済）" if gc_cfg.get("volume_confirm") else "5日線が25日線を上抜け",
+                    "priority":    1,
+                })
 
-    if row["volume_ratio"] >= cfg["signals"]["volume_surge"]["multiplier"]:
-        res.append({"signal_type": "出来高急増", "reason": f"出来高 {row['volume_ratio']:.1f}倍", "priority": 3})
+    # ---- ② RSI中立以下（enabled: false で無効化） ----
+    if ri_cfg.get("enabled", True):
+        if row["rsi_14"] < ri_cfg.get("threshold", 40):
+            res.append({
+                "signal_type": "RSI中立以下",
+                "reason":      f"RSI: {row['rsi_14']:.1f}",
+                "priority":    2,
+            })
+
+    # ---- ③ 出来高急増（multiplier を YAML から取得） ----
+    if vs_cfg.get("enabled", True):
+        multiplier = float(vs_cfg.get("multiplier", 3.0))
+        if row["volume_ratio"] >= multiplier:
+            res.append({
+                "signal_type": "出来高急増",
+                "reason":      f"出来高 {row['volume_ratio']:.1f}倍",
+                "priority":    3,
+            })
 
     if not res:
         return []
@@ -211,7 +241,6 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     trailing_on    = trailing_cfg.get("enabled", True)
     trail_cond     = trailing_cfg.get("conditions", {})
     rsi_overbought = immediate_cfg.get("rsi_overbought", 70)
-    # 実運用用の損切り設定を取得
     stop_loss_limit = exit_cfg.get("stop_loss_pct")
 
     db             = database_manager.DBManager()
@@ -250,18 +279,13 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
         rsi         = float(row["rsi_14"])
         exit_reason = None
 
-        # 1. 損切り判定を最優先（バックテストと同期）
         if stop_loss_limit and pnl_pct <= -stop_loss_limit:
             exit_reason = f"固定損切り到達 ({pnl_pct:.2f}%)"
-
-        # 2. 短期保有期間中の判定
         elif held_days < hold_days:
             if immediate_cfg.get("dead_cross", True) and is_dc:
                 exit_reason = "デッドクロス発生"
             elif rsi >= rsi_overbought:
                 exit_reason = f"RSI過熱 ({rsi:.1f})"
-        
-        # 3. 長期保有・トレーリング判定
         else:
             if trailing_on:
                 reasons = []
@@ -331,7 +355,7 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
         .groupby("ticker")["date"].max()
     )
     stale_tickers = set(latest_per[latest_per < stale_limit.date()].index)
-    
+
     open_positions = database_manager.DBManager().load_open_positions()
     open_tickers   = set(open_positions["ticker"].tolist()) if not open_positions.empty else set()
 
