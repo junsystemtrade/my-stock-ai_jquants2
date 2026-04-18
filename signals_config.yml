@@ -2,22 +2,18 @@
 # ==================
 # 戦略: トレンドフォロー・初動ブレイク狙い
 # ターゲット: 流動性の高い中大型株
-# 【改善版】scoring_system.py の新パラメータに対応
 
 signals:
-  # ---- ① トレンド発生のトリガー ----
   golden_cross:
     enabled: true
     short_window: 5
     long_window: 25
 
-  # ---- ② RSIによるチェック ----
   rsi_oversold:
     enabled: true
     window: 14
     threshold: 40
 
-  # ---- ③ 出来高による裏付け ----
   volume_surge:
     enabled: true
     window: 20
@@ -28,27 +24,21 @@ filter:
   max_price: 50000
   min_data_days: 80
   exclude_code_range:
-    - [1300, 1699]  # 主要なETF/ETN
-    - [2000, 2099]  # ETN
-    - [2500, 2639]  # ETF
-    - [2840, 2859]  # ETF
-    - [8950, 8999]  # REIT
+    - [1300, 1699]
+    - [2000, 2099]
+    - [2500, 2639]
+    - [2840, 2859]
+    - [8950, 8999]
   min_daily_turnover_avg_20: 500000000
   max_signals_per_ticker: 1
-
   require_above_ma25: true
-
-  # 市場全体の地合いフィルター
   market_breaker:
     enabled: true
     symbol: "NIY=F"
     drop_threshold_pct: -1.5
-
-  # ストップ高フィルター
   stop_high:
     enabled: true
 
-# スコアリングロジック
 scoring_logic:
   enabled: true
   weights:
@@ -57,49 +47,34 @@ scoring_logic:
     rsi_position:    20
     liquidity_scale: 10
   parameters:
-    # 出来高
     volume_max_multiplier: 5.0
-    volume_penalty_above:  8.0    # ★NEW: 8倍超えはペナルティ開始
+    volume_penalty_above:  8.0
+    bias_limit_pct:        10.0
+    bias_ideal_min:        0.5
+    bias_ideal_max:        5.0
+    turnover_ideal_min:    1000000000
+    rsi_ideal_range:       [40, 65]
+    rsi_penalty_above:     72
+    ma25_upward_bonus:     5.0
 
-    # 乖離率
-    bias_limit_pct:   10.0
-    bias_ideal_min:    0.5        # ★NEW: 理想乖離率 下限
-    bias_ideal_max:    5.0        # ★NEW: 理想乖離率 上限
-
-    # RSI
-    turnover_ideal_min: 1000000000
-    rsi_ideal_range: [40, 65]
-    rsi_penalty_above: 72         # ★NEW: 72以上は0点
-
-    # 25日線傾きボーナス
-    ma25_upward_bonus: 5.0        # ★NEW: 上向きなら+5点
-
-# 手じまいロジック設定
 exit_rules:
   stop_loss_pct: 3.0
   immediate:
     dead_cross: true
     rsi_overbought: 70
   hold_days: 10
-
-  # ★改善: トレーリング早期発動
   trailing:
     enabled: true
-    # 含み益がこの%を超えたら hold_days を待たずにトレーリング開始
-    early_activation_pct: 4.0    # ★NEW
+    early_activation_pct: 4.0
     conditions:
       golden_cross_maintained: true
       rsi_below: 70
       profit_required: true
 
-# バックテストパラメータ
 backtest:
   stop_loss_pct: 3.0
   initial_capital: 1000000
   position_size: 0.1
   max_daily_entries: 3
   market_crash_limit: -2.0
-
-  # ★NEW: スコア除外範囲（95点以上を除外してテスト）
-  # 効果確認後に調整してください
-  # exclude_score_range: [95, 100.1]
+  # exclude_score_range は無効（全スコア帯を出力）
