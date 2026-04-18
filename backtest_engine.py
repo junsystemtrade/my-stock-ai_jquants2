@@ -8,13 +8,12 @@ RSI過熱の集計を正規化し、通知を2000文字以内に収める。
 【売買ルール】
 - エントリー  : シグナル発生翌日の始値（open）で約定
 - 手じまい判定: 当日終値ベースの指標・損益で全条件を判定
-              （ストップロス・RSI過熱・デッドクロス・トレーリング全て同じ）
 - 手じまい約定: 判定成立の翌日始値（open）で約定
 - データ末尾  : 最終日の始値で約定
 
-【改善】
-- _calc_summary にシグナル種別分析を追加
-- exclude_score_range を無効化（全スコア帯を出力）
+【変更履歴】
+- min_score 対応（backtest.min_score 未満のシグナルを除外）
+- max_daily_entries を 2 に変更（YAML設定値を使用）
 """
 
 import os
@@ -35,17 +34,15 @@ _DEFAULT_BT_PARAMS = {
     "stop_loss_pct":       3.0,
     "initial_capital":     1_000_000,
     "position_size":       0.1,
-    "max_daily_entries":   3,
+    "max_daily_entries":   2,
     "market_crash_limit":  -2.0,
+    "min_score":           55.0,
 }
 
 def _load_bt_params() -> dict:
     cfg = _load_config()
     bt  = cfg.get("backtest", {})
-    params = {**_DEFAULT_BT_PARAMS, **bt}
-    # exclude_score_range を強制無効化
-    params.pop("exclude_score_range", None)
-    return params
+    return {**_DEFAULT_BT_PARAMS, **bt}
 
 
 # -----------------------------------------------------------------------
@@ -191,7 +188,6 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
     df["score_bin"] = (df["score"] // 5) * 5
     df["exit_reason_normalized"] = df["exit_reason"].apply(_normalize_exit_reason)
 
-    # スコア帯別集計
     score_stats = {}
     for bin_val, group in df.groupby("score_bin"):
         wins         = group[group["pnl_pct"] > 0]
@@ -206,7 +202,6 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
             "pf":         round(gross_profit / gross_loss, 2),
         }
 
-    # ★NEW: シグナル種別集計
     signal_stats = {}
     for sig_type, group in df.groupby("signal_type"):
         wins         = group[group["pnl_pct"] > 0]
@@ -240,7 +235,7 @@ def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
         "profit_factor":    round(gross_profit / gross_loss, 2),
         "exit_counts":      exit_counts,
         "score_analysis":   score_stats,
-        "signal_analysis":  signal_stats,  # ★NEW
+        "signal_analysis":  signal_stats,
     }
 
 
@@ -254,18 +249,6 @@ def _format_report_plain(summary: dict) -> str:
     )[:10]:
         exit_str += f"  {reason}: {count}回\n"
 
-    score_str = "\n【スコア別詳細分析（5点刻み）】\n"
-    score_str += "─" * 40 + "\n"
-    for bin_val, v in sorted(
-        summary.get("score_analysis", {}).items(), key=lambda x: x[0], reverse=True
-    ):
-        label = f"{bin_val:2.0f}-{bin_val+4.9:4.1f}点"
-        score_str += (
-            f"{label}: {v['count']:>3}回 | 勝率{v['win_rate']:>5}% | "
-            f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | PF:{v['pf']:>4.2f}\n"
-        )
-
-    # ★NEW: シグナル種別レポート
     signal_str = "\n【シグナル種別分析】\n"
     signal_str += "─" * 40 + "\n"
     for sig_type, v in sorted(
@@ -275,6 +258,17 @@ def _format_report_plain(summary: dict) -> str:
             f"{sig_type}: {v['count']:>4}回 | 勝率{v['win_rate']:>5}% | "
             f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | "
             f"PF:{v['pf']:>4.2f} | 合計{v['total_pnl']:>+10,.0f}円\n"
+        )
+
+    score_str = "\n【スコア別詳細分析（5点刻み）】\n"
+    score_str += "─" * 40 + "\n"
+    for bin_val, v in sorted(
+        summary.get("score_analysis", {}).items(), key=lambda x: x[0], reverse=True
+    ):
+        label = f"{bin_val:2.0f}-{bin_val+4.9:4.1f}点"
+        score_str += (
+            f"{label}: {v['count']:>3}回 | 勝率{v['win_rate']:>5}% | "
+            f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | PF:{v['pf']:>4.2f}\n"
         )
 
     return (
@@ -330,9 +324,11 @@ def run_backtest_and_report():
 
     cfg       = _load_config()
     bt_params = _load_bt_params()
+    min_score = float(bt_params.get("min_score", 55.0))
 
     print(f"  ストップロス: {bt_params['stop_loss_pct']}%")
-    print(f"  スコア除外: なし（全帯出力）")
+    print(f"  最小スコア: {min_score}点")
+    print(f"  最大日次エントリー: {bt_params['max_daily_entries']}件")
 
     db     = DBManager()
     df_all = db.load_analysis_data(days=365 * 3)
@@ -379,6 +375,10 @@ def run_backtest_and_report():
 
             score = calculate_score(pd.Series(hits[0]), scoring_cfg)
 
+            # ★ min_score フィルター
+            if score < min_score:
+                continue
+
             all_signals.append({
                 "date":        pd.to_datetime(entry_date),
                 "ticker":      ticker,
@@ -397,7 +397,7 @@ def run_backtest_and_report():
         sig_df
         .sort_values(["date", "score"], ascending=[True, False])
         .groupby("date")
-        .head(bt_params["max_daily_entries"])
+        .head(bt_params["max_daily_entries"])  # 上位2件
     )
 
     final_trades, free_dates = [], {}
