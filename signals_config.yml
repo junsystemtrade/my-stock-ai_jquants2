@@ -3,32 +3,31 @@
 # 戦略: トレンドフォロー・初動ブレイク狙い
 # ターゲット: 流動性の高い中大型株
 #
-# 【改善内容】
-# 1. RSI中立以下を無効化（PF0.43、完全に足を引っ張っていたため）
-# 2. 出来高急増の閾値を2.0倍→3.0倍に引き上げ（質の低いシグナルを削減）
-# 3. ゴールデンクロスに出来高確認条件を追加（volume_confirm）
-#    → GCと同時に出来高1.5倍以上を要求することで精度を上げる
+# 【変更履歴】
+# - RSI中立以下を無効化（PF0.43）
+# - 出来高急増の閾値を2.0→3.0倍に引き上げ
+# - GCにvolume_confirm追加
+# - ma25_upward_bonus を0.0に変更
+# - min_score: 55（低スコア帯の赤字を除外）
+# - max_daily_entries: 2（上位2件のみに絞り込み）
 
 signals:
-  # ---- ① トレンド発生のトリガー（主力） ----
   golden_cross:
     enabled: true
     short_window: 5
     long_window: 25
-    volume_confirm: true      # ★NEW: GC発生時に出来高1.5倍以上を要求
-    volume_confirm_ratio: 1.5 # ★NEW: 出来高確認の閾値
+    volume_confirm: true
+    volume_confirm_ratio: 1.5
 
-  # ---- ② RSIによるチェック（無効化） ----
   rsi_oversold:
-    enabled: false  # ★変更: PF0.43のため無効化
+    enabled: false
     window: 14
     threshold: 40
 
-  # ---- ③ 出来高による裏付け（閾値引き上げ） ----
   volume_surge:
     enabled: true
     window: 20
-    multiplier: 3.0  # ★変更: 2.0→3.0（質の低いシグナルを削減）
+    multiplier: 3.0
 
 filter:
   min_price: 500
@@ -66,7 +65,7 @@ scoring_logic:
     turnover_ideal_min:    1000000000
     rsi_ideal_range:       [40, 65]
     rsi_penalty_above:     72
-    ma25_upward_bonus:     0.0  # ★変更: 5.0→0.0（スコア帯ずれを修正）
+    ma25_upward_bonus:     0.0
 
 exit_rules:
   stop_loss_pct: 3.0
@@ -86,5 +85,6 @@ backtest:
   stop_loss_pct: 3.0
   initial_capital: 1000000
   position_size: 0.1
-  max_daily_entries: 3
+  max_daily_entries: 2    # ★変更: 3→2（上位2件のみ）
   market_crash_limit: -2.0
+  min_score: 55           # ★NEW: 55点未満を除外
