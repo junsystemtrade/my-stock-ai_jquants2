@@ -415,6 +415,11 @@ def run_backtest_and_report():
 
             if score < min_score:
                 continue
+            # 除外スコア帯チェック
+            exclude_ranges = bt_params.get("exclude_score_ranges", [])
+            if any(r[0] <= score < r[1] for r in exclude_ranges):
+                continue
+
 
             all_signals.append({
                 "date":        pd.to_datetime(entry_date),
