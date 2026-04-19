@@ -1,14 +1,14 @@
 """
 signal_engine.py
-
+================
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
 
-【改善内容】
-- golden_cross に volume_confirm オプションを追加
-  volume_confirm: true の場合、GC発生時に出来高が volume_confirm_ratio 倍以上
-  であることを条件に加える（出来高の裏付けのないGCを除外）
-- rsi_oversold は enabled: false で無効化対応済み
-- volume_surge の multiplier は YAML設定値を使用（3.0倍に変更済み）
+変更点:
+  - ゴールデンクロスに追加条件を実装
+    ① require_ma25_upward: 25日線が上向きの時のみ
+    ② volume_confirm: 出来高が平均以上の時のみ
+    ③ bias_range: 25日線からの乖離率が適正範囲内のみ
+  - 出来高急増・RSI中立以下は設定で無効化
 """
 
 import os
@@ -23,22 +23,27 @@ import portfolio_manager
 
 _CONFIG_PATH = Path(__file__).parent / "signals_config.yml"
 
+
 def _load_config() -> dict:
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, encoding="utf-8") as f:
             return yaml.safe_load(f)
     return {
         "signals": {
-            "golden_cross": {"enabled": True, "short_window": 5, "long_window": 25},
+            "golden_cross": {
+                "enabled": True, "short_window": 5, "long_window": 25,
+                "require_ma25_upward": True,
+                "volume_confirm": True, "volume_confirm_ratio": 1.2,
+                "bias_range": {"enabled": True, "min_pct": -5.0, "max_pct": 10.0},
+            },
             "rsi_oversold":  {"enabled": False, "window": 14, "threshold": 40},
-            "volume_surge":  {"enabled": True, "window": 20, "multiplier": 3.0},
+            "volume_surge":  {"enabled": False, "window": 20, "multiplier": 3.0},
         },
         "filter": {
             "min_price": 500, "max_price": 50000,
             "min_data_days": 80,
             "min_daily_turnover_avg_20": 500000000,
             "exclude_code_range": [[1000, 1999]],
-            "max_signals_per_ticker": 1,
             "require_above_ma25": True,
         },
         "exit_rules": {
@@ -50,37 +55,38 @@ def _load_config() -> dict:
         }
     }
 
+
 def _today_jst():
     return datetime.now(ZoneInfo("Asia/Tokyo")).date()
 
-# ---------------------------------------------------------------------
-# 地合い判定
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# 地合い判定
+# -----------------------------------------------------------------------
 def _get_market_condition() -> tuple[float, str]:
     db    = database_manager.DBManager()
     query = text("SELECT price FROM daily_prices WHERE ticker = 'NIY=F' ORDER BY date DESC LIMIT 2")
     try:
         with db.engine.connect() as conn:
             df_niy = pd.read_sql(query, conn)
-            if len(df_niy) < 2:
-                return 0.0, "不明"
-            p_now    = float(df_niy["price"].iloc[0])
-            p_prev   = float(df_niy["price"].iloc[1])
-            m_change = (p_now - p_prev) / p_prev * 100
-            if m_change <= -2.0:    status = "暴落警戒"
-            elif m_change <= -0.5:  status = "軟調"
-            elif m_change >= 0.5:   status = "好調"
-            else:                   status = "平穏"
-            return round(m_change, 2), status
+        if len(df_niy) < 2:
+            return 0.0, "不明"
+        p_now    = float(df_niy["price"].iloc[0])
+        p_prev   = float(df_niy["price"].iloc[1])
+        m_change = (p_now - p_prev) / p_prev * 100
+        if m_change <= -2.0:    status = "暴落警戒"
+        elif m_change <= -0.5:  status = "軟調"
+        elif m_change >= 0.5:   status = "好調"
+        else:                   status = "平穏"
+        return round(m_change, 2), status
     except Exception as e:
         print(f"WARNING market condition: {e}")
         return 0.0, "エラー"
 
-# ---------------------------------------------------------------------
-# ストップ高判定
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# ストップ高判定
+# -----------------------------------------------------------------------
 def _is_stop_high(price: float, prev_price: float) -> bool:
     if prev_price <= 0:
         return False
@@ -110,16 +116,17 @@ def _is_stop_high(price: float, prev_price: float) -> bool:
     else:                      limit = 200000
     return (price - prev_price) >= limit
 
-# ---------------------------------------------------------------------
-# 指標計算
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# 指標計算
+# -----------------------------------------------------------------------
 def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df     = df.copy()
     close  = df["price"].astype(float)
     volume = df["volume"].astype(float)
 
     df["volume_ratio"]    = volume / volume.rolling(window=5).mean().shift(1)
+    df["volume_avg_20"]   = volume.rolling(window=20).mean()
     ma25                  = close.rolling(window=25).mean()
     df["mavg_25_diff"]    = (close - ma25) / ma25 * 100
     ma5                   = close.rolling(window=5).mean()
@@ -137,10 +144,10 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi_14"] = 100 - (100 / (1 + (gain / loss.replace(0, float("nan")))))
     return df
 
-# ---------------------------------------------------------------------
-# シグナル判定コア
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# シグナル判定コア
+# -----------------------------------------------------------------------
 def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     code_str = ticker.replace(".T", "").strip()
     if any(
@@ -179,47 +186,85 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
         if not bool(row.get("is_above_ma25", False)):
             return []
 
-    res    = []
-    sma_s  = df["sma_5"]
-    sma_l  = df["sma_25"]
-    gc_cfg = cfg["signals"].get("golden_cross", {})
-    vs_cfg = cfg["signals"].get("volume_surge", {})
-    ri_cfg = cfg["signals"].get("rsi_oversold", {})
+    res      = []
+    signals  = cfg.get("signals", {})
 
     # ---- ① ゴールデンクロス ----
+    gc_cfg = signals.get("golden_cross", {})
     if gc_cfg.get("enabled", True):
-        is_gc = sma_s.iloc[-2] <= sma_l.iloc[-2] and sma_s.iloc[-1] > sma_l.iloc[-1]
+        sma_s = df["sma_5"]
+        sma_l = df["sma_25"]
+        is_gc = (
+            len(sma_s) > 1
+            and sma_s.iloc[-2] <= sma_l.iloc[-2]
+            and sma_s.iloc[-1] > sma_l.iloc[-1]
+        )
         if is_gc:
-            # volume_confirm オプション
-            volume_ok = True
-            if gc_cfg.get("volume_confirm", False):
-                confirm_ratio = float(gc_cfg.get("volume_confirm_ratio", 1.5))
-                volume_ok = float(row.get("volume_ratio", 0)) >= confirm_ratio
-            if volume_ok:
+            skip = False
+
+            # 追加条件① 25日線が上向き
+            if gc_cfg.get("require_ma25_upward", False):
+                if not bool(row.get("ma25_upward", False)):
+                    skip = True
+
+            # 追加条件② 出来高確認
+            if not skip and gc_cfg.get("volume_confirm", False):
+                ratio     = gc_cfg.get("volume_confirm_ratio", 1.2)
+                vol_avg20 = float(row.get("volume_avg_20", 0))
+                vol_today = float(df["volume"].astype(float).iloc[-1])
+                if vol_avg20 > 0 and vol_today < vol_avg20 * ratio:
+                    skip = True
+
+            # 追加条件③ 乖離率が適正範囲内
+            if not skip:
+                bias_cfg = gc_cfg.get("bias_range", {})
+                if bias_cfg.get("enabled", False):
+                    bias = float(row.get("mavg_25_diff", 0))
+                    b_min = bias_cfg.get("min_pct", -5.0)
+                    b_max = bias_cfg.get("max_pct", 10.0)
+                    if not (b_min <= bias <= b_max):
+                        skip = True
+
+            if not skip:
                 res.append({
                     "signal_type": "ゴールデンクロス(短期)",
-                    "reason":      "5日線が25日線を上抜け（出来高確認済）" if gc_cfg.get("volume_confirm") else "5日線が25日線を上抜け",
+                    "reason":      "5日線が25日線を上抜け",
                     "priority":    1,
                 })
 
-    # ---- ② RSI中立以下（enabled: false で無効化） ----
-    if ri_cfg.get("enabled", True):
-        if row["rsi_14"] < ri_cfg.get("threshold", 40):
+    # ---- ② RSI売られすぎ ----
+    rsi_cfg = signals.get("rsi_oversold", {})
+    if rsi_cfg.get("enabled", False):
+        if row["rsi_14"] < rsi_cfg.get("threshold", 40):
             res.append({
                 "signal_type": "RSI中立以下",
                 "reason":      f"RSI: {row['rsi_14']:.1f}",
                 "priority":    2,
             })
 
-    # ---- ③ 出来高急増（multiplier を YAML から取得） ----
-    if vs_cfg.get("enabled", True):
-        multiplier = float(vs_cfg.get("multiplier", 3.0))
-        if row["volume_ratio"] >= multiplier:
-            res.append({
-                "signal_type": "出来高急増",
-                "reason":      f"出来高 {row['volume_ratio']:.1f}倍",
-                "priority":    3,
-            })
+    # ---- ③ 出来高急増 ----
+    vol_cfg = signals.get("volume_surge", {})
+    if vol_cfg.get("enabled", False):
+        if row["volume_ratio"] >= vol_cfg.get("multiplier", 3.0):
+            # RSI範囲チェック
+            if vol_cfg.get("require_rsi_range", False):
+                rsi    = float(row.get("rsi_14", 50))
+                r_min  = vol_cfg.get("rsi_min", 40)
+                r_max  = vol_cfg.get("rsi_max", 65)
+                if not (r_min <= rsi <= r_max):
+                    pass
+                else:
+                    res.append({
+                        "signal_type": "出来高急増",
+                        "reason":      f"出来高 {row['volume_ratio']:.1f}倍",
+                        "priority":    3,
+                    })
+            else:
+                res.append({
+                    "signal_type": "出来高急増",
+                    "reason":      f"出来高 {row['volume_ratio']:.1f}倍",
+                    "priority":    3,
+                })
 
     if not res:
         return []
@@ -228,10 +273,10 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     best.update({"ticker": ticker, "price": price, **row.to_dict()})
     return [best]
 
-# ---------------------------------------------------------------------
-# 手じまいシグナル判定
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# 手じまいシグナル判定
+# -----------------------------------------------------------------------
 def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     cfg            = _load_config()
     exit_cfg       = cfg.get("exit_rules", {})
@@ -241,7 +286,6 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     trailing_on    = trailing_cfg.get("enabled", True)
     trail_cond     = trailing_cfg.get("conditions", {})
     rsi_overbought = immediate_cfg.get("rsi_overbought", 70)
-    stop_loss_limit = exit_cfg.get("stop_loss_pct")
 
     db             = database_manager.DBManager()
     open_positions = db.load_open_positions()
@@ -275,13 +319,15 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
         sma_s       = df_ticker["sma_5"]
         sma_l       = df_ticker["sma_25"]
         is_gc       = sma_s.iloc[-1] > sma_l.iloc[-1]
-        is_dc       = len(sma_s) > 1 and sma_s.iloc[-2] >= sma_l.iloc[-2] and sma_s.iloc[-1] < sma_l.iloc[-1]
+        is_dc       = (
+            len(sma_s) > 1
+            and sma_s.iloc[-2] >= sma_l.iloc[-2]
+            and sma_s.iloc[-1] < sma_l.iloc[-1]
+        )
         rsi         = float(row["rsi_14"])
         exit_reason = None
 
-        if stop_loss_limit and pnl_pct <= -stop_loss_limit:
-            exit_reason = f"固定損切り到達 ({pnl_pct:.2f}%)"
-        elif held_days < hold_days:
+        if held_days < hold_days:
             if immediate_cfg.get("dead_cross", True) and is_dc:
                 exit_reason = "デッドクロス発生"
             elif rsi >= rsi_overbought:
@@ -320,10 +366,10 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     print(f"INFO exit signals: {len(exit_signals)}")
     return exit_signals
 
-# ---------------------------------------------------------------------
-# メインスキャン（買いシグナル）
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# メインスキャン（買いシグナル）
+# -----------------------------------------------------------------------
 def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[dict]:
     if daily_data.empty:
         return []
@@ -341,6 +387,7 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
             print(f"WARNING market_breaker: {market_change:+.2f}% -> skip scan")
             return []
 
+    # フィルター① JPXマスター（上場廃止・整理・監理除外）
     jpx_tickers = set()
     try:
         jpx_tickers = set(portfolio_manager.get_target_tickers().keys())
@@ -348,19 +395,25 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
     except Exception as e:
         print(f"WARNING JPX fetch failed: {e}")
 
-    db_max_date  = daily_data[daily_data["ticker"] != "NIY=F"]["date"].max()
-    stale_limit  = pd.Timestamp(db_max_date) - pd.Timedelta(days=7)
-    latest_per   = (
+    # フィルター② 古データ除外（DB最終日から7日以上古い銘柄）
+    db_max_date = daily_data[daily_data["ticker"] != "NIY=F"]["date"].max()
+    stale_limit = pd.Timestamp(db_max_date) - pd.Timedelta(days=7)
+    latest_per  = (
         daily_data[daily_data["ticker"] != "NIY=F"]
         .groupby("ticker")["date"].max()
     )
     stale_tickers = set(latest_per[latest_per < stale_limit.date()].index)
+    if stale_tickers:
+        print(f"INFO stale tickers excluded: {len(stale_tickers)}")
 
+    # フィルター③ オープンポジション除外
     open_positions = database_manager.DBManager().load_open_positions()
-    open_tickers   = set(open_positions["ticker"].tolist()) if not open_positions.empty else set()
-
-    require_ma25 = cfg["filter"].get("require_above_ma25", False)
-    print(f"INFO require_above_ma25: {require_ma25}")
+    open_tickers   = (
+        set(open_positions["ticker"].tolist())
+        if not open_positions.empty else set()
+    )
+    if open_tickers:
+        print(f"INFO open positions excluded: {open_tickers}")
 
     all_hits = []
     for ticker, df_ticker in daily_data[daily_data["ticker"] != "NIY=F"].groupby("ticker"):
