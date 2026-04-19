@@ -27,7 +27,7 @@ signals:
   volume_surge:
     enabled: true
     window: 20
-    multiplier: 3.0
+    multiplier: 2.0
     require_rsi_range: true   # ← 追加
     rsi_min: 40               # ← 追加
     rsi_max: 65               # ← 追加
