@@ -96,3 +96,6 @@ backtest:
   max_daily_entries: 2
   market_crash_limit: -2.0
   min_score: 55
+  exclude_score_ranges:
+    - [70, 75]   # 70-74.9点を除外
+    - [90, 95]   # 90-94.9点を除外
