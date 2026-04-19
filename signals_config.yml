@@ -1,23 +1,31 @@
 # signals_config.yml
 # ==================
-# 戦略: トレンドフォロー・初動ブレイク狙い
+# 戦略: ゴールデンクロス特化・トレンド初動狙い
 # ターゲット: 流動性の高い中大型株
 #
 # 【変更履歴】
-# - RSI中立以下を無効化（PF0.43）
-# - 出来高急増の閾値を2.0→3.0倍に引き上げ
-# - GCにvolume_confirm追加
-# - ma25_upward_bonus を0.0に変更
-# - min_score: 55（低スコア帯の赤字を除外）
-# - max_daily_entries: 2（上位2件のみに絞り込み）
+# - 出来高急増を無効化（PF低下の原因）
+# - RSI中立以下を無効化
+# - ゴールデンクロスに追加条件を設定
+#   ① 25日線が上向き（require_ma25_upward）
+#   ② 25日線からの乖離率が適正範囲内（bias_range）
+#   ③ 出来高が平均以上（volume_confirm）
 
 signals:
   golden_cross:
     enabled: true
     short_window: 5
     long_window: 25
+    # ① 25日線が上向きの時のみエントリー
+    require_ma25_upward: true
+    # ② 出来高が平均の1.2倍以上の時のみエントリー（勢いの確認）
     volume_confirm: true
-    volume_confirm_ratio: 1.5
+    volume_confirm_ratio: 1.2
+    # ③ 25日線からの乖離率が適正範囲内のみ（高値掴み防止）
+    bias_range:
+      enabled: true
+      min_pct: -5.0   # 25日線から-5%より下は見送り（下落途中）
+      max_pct: 10.0   # 25日線から+10%より上は見送り（上がりすぎ）
 
   rsi_oversold:
     enabled: false
@@ -25,12 +33,9 @@ signals:
     threshold: 40
 
   volume_surge:
-    enabled: true
+    enabled: false
     window: 20
-    multiplier: 2.0
-    require_rsi_range: true   # ← 追加
-    rsi_min: 40               # ← 追加
-    rsi_max: 65               # ← 追加
+    multiplier: 3.0
 
 filter:
   min_price: 500
@@ -88,6 +93,6 @@ backtest:
   stop_loss_pct: 3.0
   initial_capital: 1000000
   position_size: 0.1
-  max_daily_entries: 2    # ★変更: 3→2（上位2件のみ）
+  max_daily_entries: 2
   market_crash_limit: -2.0
-  min_score: 55           # ★NEW: 55点未満を除外
+  min_score: 55
