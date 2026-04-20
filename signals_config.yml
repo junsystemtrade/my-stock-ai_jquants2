@@ -1,31 +1,25 @@
 # signals_config.yml
 # ==================
 # 戦略: ゴールデンクロス特化・トレンド初動狙い
-# ターゲット: 流動性の高い中大型株
 #
-# 【変更履歴】
-# - 出来高急増を無効化（PF低下の原因）
-# - RSI中立以下を無効化
-# - ゴールデンクロスに追加条件を設定
-#   ① 25日線が上向き（require_ma25_upward）
-#   ② 25日線からの乖離率が適正範囲内（bias_range）
-#   ③ 出来高が平均以上（volume_confirm）
+# 【スコアリング修正】
+# 旧: 出来高40 / 乖離率30 / RSI20 / 流動性10
+#     → 出来高急増前提の設計でGCには不向き
+# 新: 乖離率40 / RSI30 / 流動性20 / 出来高10
+#     → GCの質（適正な乖離率・RSI・流動性）を重視
 
 signals:
   golden_cross:
     enabled: true
     short_window: 5
     long_window: 25
-    # ① 25日線が上向きの時のみエントリー
     require_ma25_upward: true
-    # ② 出来高が平均の1.2倍以上の時のみエントリー（勢いの確認）
     volume_confirm: true
     volume_confirm_ratio: 1.2
-    # ③ 25日線からの乖離率が適正範囲内のみ（高値掴み防止）
     bias_range:
       enabled: true
-      min_pct: -5.0   # 25日線から-5%より下は見送り（下落途中）
-      max_pct: 10.0   # 25日線から+10%より上は見送り（上がりすぎ）
+      min_pct: -5.0
+      max_pct: 10.0
 
   rsi_oversold:
     enabled: false
@@ -57,22 +51,24 @@ filter:
   stop_high:
     enabled: true
 
+# GC特化スコアリング
+# 乖離率・RSI・流動性を重視、出来高は補助的に
 scoring_logic:
   enabled: true
   weights:
-    volume_surge:    40
-    bias_proximity:  30
-    rsi_position:    20
-    liquidity_scale: 10
+    volume_surge:    10   # 出来高（補助的）
+    bias_proximity:  40   # 乖離率（GCの質を判断）
+    rsi_position:    30   # RSI（過熱感チェック）
+    liquidity_scale: 20   # 流動性（安定した銘柄を選ぶ）
   parameters:
     volume_max_multiplier: 5.0
     volume_penalty_above:  8.0
     bias_limit_pct:        10.0
-    bias_ideal_min:        0.5
-    bias_ideal_max:        5.0
-    turnover_ideal_min:    1000000000
-    rsi_ideal_range:       [40, 65]
-    rsi_penalty_above:     72
+    bias_ideal_min:        0.5    # 25日線から0.5%以上上
+    bias_ideal_max:        5.0    # 25日線から5%以内が理想
+    turnover_ideal_min:    3000000000  # 30億円以上で満点（流動性重視）
+    rsi_ideal_range:       [45, 65]   # RSI45〜65が理想（過熱でも過売でもない）
+    rsi_penalty_above:     70
     ma25_upward_bonus:     0.0
 
 exit_rules:
@@ -97,5 +93,5 @@ backtest:
   market_crash_limit: -2.0
   min_score: 55
   exclude_score_ranges:
-    - [70, 75]   # 70-74.9点を除外
-    - [90, 95]   # 90-94.9点を除外
+    - [70, 75]
+    - [90, 95]
