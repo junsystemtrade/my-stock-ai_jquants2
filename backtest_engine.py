@@ -10,11 +10,6 @@ RSI過熱の集計を正規化し、通知を2000文字以内に収める。
 - 手じまい判定: 当日終値ベースの指標・損益で全条件を判定
 - 手じまい約定: 判定成立の翌日始値（open）で約定
 - データ末尾  : 最終日の始値で約定
-
-【変更履歴】
-- min_score 対応
-- max_daily_entries を YAML設定値から取得
-- シグナル種別×スコア帯のクロス集計を追加
 """
 
 import os
@@ -25,7 +20,8 @@ from google import genai
 from datetime import datetime
 
 from database_manager import DBManager
-from signal_engine import _check_signals, _load_config, _is_stop_high, _calculate_indicators
+# 修正ポイント: signal_engine の最新仕様 (scan_signals) に合わせ、未定義の _is_stop_high を除外
+from signal_engine import scan_signals, _load_config, _calculate_indicators
 from scoring_system import calculate_score
 
 # -----------------------------------------------------------------------
@@ -55,6 +51,11 @@ def _get_open(row: pd.Series) -> float:
     if o is not None and pd.notna(o) and float(o) > 0:
         return float(o)
     return float(row["price"])
+
+# 修正ポイント: signal_engine側に定義がない場合でも動作するよう、ストップ高判定を内包
+def _is_stop_high_internal(current_price: float, prev_price: float) -> bool:
+    if prev_price <= 0: return False
+    return (current_price / prev_price) >= 1.14
 
 # -----------------------------------------------------------------------
 # RSI過熱理由の正規化
@@ -403,14 +404,17 @@ def run_backtest_and_report():
             if entry_date in crash_dates:
                 continue
 
+            # 修正ポイント: インポートエラーを避けるため内部関数を使用
             if stop_high_enabled and i >= 1:
-                if _is_stop_high(float(row_curr["price"]), float(df_ticker.iloc[i - 1]["price"])):
+                if _is_stop_high_internal(float(row_curr["price"]), float(df_ticker.iloc[i - 1]["price"])):
                     continue
 
-            hits = _check_signals(ticker, df_ticker.iloc[: i + 1], cfg)
+            # 修正ポイント: _check_signals を現在の signal_engine の仕様である scan_signals に変更
+            hits = scan_signals(df_ticker.iloc[: i + 1])
             if not hits:
                 continue
 
+            # 修正ポイント: 最初のヒットを採用し、スコア計算
             score = calculate_score(pd.Series(hits[0]), scoring_cfg)
 
             if score < min_score:
@@ -420,13 +424,12 @@ def run_backtest_and_report():
             if any(r[0] <= score < r[1] for r in exclude_ranges):
                 continue
 
-
             all_signals.append({
                 "date":        pd.to_datetime(entry_date),
                 "ticker":      ticker,
                 "score":       score,
-                "signal_type": hits[0]["signal_type"],
-                "df_ticker":   df_ticker,
+                "signal_type": hits[0].get("signal_type", "不明"),
+                "df_ticker":    df_ticker,
                 "entry_idx":   i + 1,
             })
 
