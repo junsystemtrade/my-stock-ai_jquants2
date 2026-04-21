@@ -1,10 +1,10 @@
 """
-backtest_engine.py (超高速化版)
+backtest_engine.py (修正・完全版)
 
-【主な改善点】
-1. scan_signals をループ外（銘柄単位）に移動。計算量を O(N^2) から O(N) へ削減。
-2. df_ticker.iloc[i+1]['date'] の検索を辞書/インデックス参照で高速化。
-3. 3年分のデータバックテストを現実的な時間（数分）で完結。
+【修正内容】
+- ImportError を解消（関数を同一ファイル内に配置）
+- scan_signals の一括処理による高速化ロジックを維持
+- 3年分のバックテストに対応
 """
 
 import os
@@ -44,14 +44,13 @@ def _get_open(row: pd.Series) -> float:
 
 def _is_stop_high_internal(current_price: float, prev_price: float) -> bool:
     if prev_price <= 0: return False
-    # Junさんのロジック：14%以上の上昇をストップ高付近と判定
     return (current_price / prev_price) >= 1.14
 
 def _normalize_exit_reason(reason: str) -> str:
     return re.sub(r"RSI過熱([\d.]+)", "RSI過熱", reason)
 
 # -----------------------------------------------------------------------
-# 手じまい判定 (ロジック維持)
+# 手じまい・ロジック
 # -----------------------------------------------------------------------
 
 def _should_exit_trailing(row, entry_price, cfg, held, hold_days):
@@ -126,22 +125,60 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
     }
 
 # -----------------------------------------------------------------------
-# メイン実行 (ロジックを維持しつつ高速化)
+# レポート作成用関数 (内部に移動)
+# -----------------------------------------------------------------------
+
+def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
+    if not trades: return {"total_trades": 0}
+    df = pd.DataFrame(trades)
+    wins = df[df["pnl_pct"] > 0]
+    gross_p = wins["pnl_yen"].sum()
+    gross_l = abs(df[df["pnl_pct"] <= 0]["pnl_yen"].sum()) or 1e-9
+    return {
+        "total_trades": len(df),
+        "win_rate": round(len(wins) / len(df) * 100, 1),
+        "avg_pnl_pct": round(df["pnl_pct"].mean(), 2),
+        "total_pnl_yen": round(df["pnl_yen"].sum(), 0),
+        "profit_factor": round(gross_p / gross_l, 2),
+        "exit_counts": df["exit_reason"].apply(_normalize_exit_reason).value_counts().to_dict()
+    }
+
+def _format_report_plain(summary: dict) -> str:
+    if summary["total_trades"] == 0: return "📊 シグナルなし"
+    res = f"📊 **バックテスト結果**\n総数: {summary['total_trades']}回 / 勝率: {summary['win_rate']}%\n"
+    res += f"平均損益: {summary['avg_pnl_pct']}% / 合計損益: {summary['total_pnl_yen']:,}円\n"
+    res += f"PF: {summary['profit_factor']}\n\n【手じまい理由】\n"
+    for r, c in summary["exit_counts"].items(): res += f"- {r}: {c}回\n"
+    return res
+
+def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
+    plain = _format_report_plain(summary)
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key: return plain
+    try:
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=f"結果を300字以内で分析して:\n{summary}\n上位:{top_trades[:3]}")
+        return f"{plain}\n💡 **分析**\n{resp.text}"
+    except: return plain
+
+def _send_discord(content: str):
+    url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if url: requests.post(url, json={"content": content[:1990]})
+
+# -----------------------------------------------------------------------
+# メイン実行
 # -----------------------------------------------------------------------
 
 def run_backtest_and_report():
-    from __main__ import _calc_summary, _format_report_with_gemini, _send_discord, _format_report_plain
     start_time = datetime.now()
     cfg = _load_config()
     bt_params = _load_bt_params()
     min_score = float(bt_params.get("min_score", 55.0))
     
     db = DBManager()
-    # 3年分(約750日)のデータをロード
     df_all = db.load_analysis_data(days=365 * 3)
     if df_all.empty: return
 
-    # 地合い(暴落日)の計算
     niy_df = df_all[df_all["ticker"] == "NIY=F"].sort_values("date").copy()
     niy_df["m_change"] = niy_df["price"].pct_change() * 100
     crash_dates = set(niy_df[niy_df["m_change"] <= bt_params["market_crash_limit"]]["date"])
@@ -159,15 +196,11 @@ def run_backtest_and_report():
         df_ticker = df_all[df_all["ticker"] == ticker].sort_values("date").reset_index(drop=True)
         if len(df_ticker) < min_days: continue
 
-        # テクニカル指標計算
         df_ticker = _calculate_indicators(df_ticker)
-
-        # 【高速化】1日ずつ回さず、全期間を一括スキャン
         hits = scan_signals(df_ticker)
         if not hits: continue
 
         for hit in hits:
-            # シグナル発生日のインデックスを特定
             i = hit.get('index')
             if i is None:
                 match_idx = df_ticker.index[df_ticker['date'] == hit['date']].tolist()
@@ -176,16 +209,13 @@ def run_backtest_and_report():
 
             if i < min_days or i >= len(df_ticker) - 1: continue
 
-            # 判定条件：翌日始値エントリー
             entry_date = df_ticker.iloc[i + 1]["date"]
             if entry_date in crash_dates: continue
 
-            # ストップ高判定
             if stop_high_enabled and i >= 1:
                 if _is_stop_high_internal(float(df_ticker.iloc[i]["price"]), float(df_ticker.iloc[i-1]["price"])):
                     continue
 
-            # スコアリング
             score = calculate_score(pd.Series(hit), scoring_cfg)
             if score < min_score: continue
             if any(r[0] <= score < r[1] for r in exclude_ranges): continue
@@ -203,7 +233,6 @@ def run_backtest_and_report():
         print("シグナルなし")
         return
 
-    # 日次制限の適用
     sig_df = pd.DataFrame(all_signals)
     selected = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
 
@@ -216,10 +245,9 @@ def run_backtest_and_report():
             final_trades.append(trade)
             free_dates[t] = trade["exit_date"]
 
-    # レポート送信
     summary = _calc_summary(final_trades, bt_params)
     report = _format_report_with_gemini(summary, sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True))
-    _send_discord(f"📈 **高速バックテスト完了**\n{report}")
+    _send_discord(report)
     print(f"✅ 完了 (所要時間: {datetime.now() - start_time})")
 
 if __name__ == "__main__":
