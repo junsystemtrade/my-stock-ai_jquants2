@@ -1,12 +1,5 @@
 # signals_config.yml
-# ==================
-# 戦略: ゴールデンクロス特化・トレンド初動狙い
-#
-# 【スコアリング修正】
-# 旧: 出来高40 / 乖離率30 / RSI20 / 流動性10
-#     → 出来高急増前提の設計でGCには不向き
-# 新: 乖離率40 / RSI30 / 流動性20 / 出来高10
-#     → GCの質（適正な乖離率・RSI・流動性）を重視
+# 戦略: ゴールデンクロス特化・トレンド初動狙い（極・精鋭モード）
 
 signals:
   golden_cross:
@@ -51,31 +44,29 @@ filter:
   stop_high:
     enabled: true
 
-# GC特化スコアリング
-# 乖離率・RSI・流動性を重視、出来高は補助的に
 scoring_logic:
   enabled: true
   weights:
-    volume_surge:    10   # 出来高（補助的）
-    bias_proximity:  40   # 乖離率（GCの質を判断）
-    rsi_position:    30   # RSI（過熱感チェック）
-    liquidity_scale: 20   # 流動性（安定した銘柄を選ぶ）
+    volume_surge: 10
+    bias_proximity: 40
+    rsi_position: 30
+    liquidity_scale: 20
   parameters:
     volume_max_multiplier: 5.0
-    volume_penalty_above:  8.0
-    bias_limit_pct:        10.0
-    bias_ideal_min:        0.5    # 25日線から0.5%以上上
-    bias_ideal_max:        5.0    # 25日線から5%以内が理想
-    turnover_ideal_min:    3000000000  # 30億円以上で満点（流動性重視）
-    rsi_ideal_range:       [45, 65]   # RSI45〜65が理想（過熱でも過売でもない）
-    rsi_penalty_above:     70
-    ma25_upward_bonus:     0.0
+    volume_penalty_above: 8.0
+    bias_limit_pct: 10.0
+    bias_ideal_min: 0.5
+    bias_ideal_max: 4.0           # 5.0→4.0へ：上がりすぎを排除し初動に集中
+    turnover_ideal_min: 3000000000
+    rsi_ideal_range: [45, 60]     # 45-65→45-60へ：過熱感をさらに先読み
+    rsi_penalty_above: 70
+    ma25_upward_bonus: 0.0
 
 exit_rules:
-  stop_loss_pct: 3.0
+  stop_loss_pct: 4.0              # 3.0→4.0へ：ノイズによる損切りを回避
   immediate:
     dead_cross: true
-    rsi_overbought: 75
+    rsi_overbought: 80            # 75→80へ：トレンドをさらに深追い
   hold_days: 10
   trailing:
     enabled: true
@@ -86,11 +77,11 @@ exit_rules:
       profit_required: true
 
 backtest:
-  stop_loss_pct: 3.0
+  stop_loss_pct: 4.0              # 3.0→4.0へ整合
   initial_capital: 1000000
   position_size: 0.1
   max_daily_entries: 2
   market_crash_limit: -2.0
-  min_score: 65.0         # 65点未満はエントリーしない
+  min_score: 70.0                 # 65→70へ：高精度な銘柄のみに限定
   exclude_score_ranges:
-    - [95, 100]            # 95点以上の「過熱しすぎ」を除外
+    - [95, 100]
