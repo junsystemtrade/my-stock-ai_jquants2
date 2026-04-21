@@ -91,4 +91,6 @@ backtest:
   position_size: 0.1
   max_daily_entries: 2
   market_crash_limit: -2.0
-  min_score: 0
+　min_score: 65.0              # 65点未満はエントリーしない
+  exclude_score_ranges:
+    - [95, 100]                # 95点以上の「過熱しすぎ」を除外
