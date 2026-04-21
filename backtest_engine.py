@@ -1,10 +1,20 @@
 """
-backtest_engine.py (超高速・詳細レポート完全復元版)
+backtest_engine.py
 
-【特徴】
-- scan_signals の一括処理による高速化（3年分データ対応）
-- スコア別、シグナル別、クロス集計のレポート表示を完全復元
-- インポートエラーを回避し、単体で動作可能
+市場環境（地合い）とスコアリングを用いた精鋭選別バックテスト。
+高速化対応・トレーリング保有延長・ストップ高除外に対応。
+RSI過熱の集計を正規化し、通知を2000文字以内に収める。
+
+【売買ルール】
+- エントリー  : シグナル発生翌日の始値（open）で約定
+- 手じまい判定: 当日終値ベースの指標・損益で全条件を判定
+- 手じまい約定: 判定成立の翌日始値（open）で約定
+- データ末尾  : 最終日の始値で約定
+
+【変更履歴】
+- min_score 対応
+- max_daily_entries を YAML設定値から取得
+- シグナル種別×スコア帯のクロス集計を追加
 """
 
 import os
@@ -15,11 +25,11 @@ from google import genai
 from datetime import datetime
 
 from database_manager import DBManager
-from signal_engine import scan_signals, _load_config, _calculate_indicators
+from signal_engine import _check_signals, _load_config, _is_stop_high, _calculate_indicators
 from scoring_system import calculate_score
 
 # -----------------------------------------------------------------------
-# 設定とヘルパー
+# バックテストパラメータ
 # -----------------------------------------------------------------------
 
 _DEFAULT_BT_PARAMS = {
@@ -36,24 +46,34 @@ def _load_bt_params() -> dict:
     bt  = cfg.get("backtest", {})
     return {**_DEFAULT_BT_PARAMS, **bt}
 
+# -----------------------------------------------------------------------
+# 始値取得ヘルパー
+# -----------------------------------------------------------------------
+
 def _get_open(row: pd.Series) -> float:
     o = row.get("open")
     if o is not None and pd.notna(o) and float(o) > 0:
         return float(o)
     return float(row["price"])
 
-def _is_stop_high_internal(current_price: float, prev_price: float) -> bool:
-    if prev_price <= 0: return False
-    return (current_price / prev_price) >= 1.14
+# -----------------------------------------------------------------------
+# RSI過熱理由の正規化
+# -----------------------------------------------------------------------
 
 def _normalize_exit_reason(reason: str) -> str:
     return re.sub(r"RSI過熱([\d.]+)", "RSI過熱", reason)
 
 # -----------------------------------------------------------------------
-# 売買ロジック
+# トレーリング手じまい判定
 # -----------------------------------------------------------------------
 
-def _should_exit_trailing(row, entry_price, cfg, held, hold_days):
+def _should_exit_trailing(
+    row: pd.Series,
+    entry_price: float,
+    cfg: dict,
+    held: int,
+    hold_days: int,
+) -> tuple[bool, list[str]]:
     trailing_cfg  = cfg.get("exit_rules", {}).get("trailing", {})
     trail_cond    = trailing_cfg.get("conditions", {})
     rsi_limit     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
@@ -64,12 +84,13 @@ def _should_exit_trailing(row, entry_price, cfg, held, hold_days):
     rsi           = float(row.get("rsi_14", 50))
     sma_5         = float(row.get("sma_5",  0))
     sma_25        = float(row.get("sma_25", 0))
+    is_gc         = sma_5 > sma_25
 
     if held < hold_days and pnl_pct < early_act_pct:
         return False, []
 
     reasons = []
-    if trail_cond.get("golden_cross_maintained", True) and not (sma_5 > sma_25):
+    if trail_cond.get("golden_cross_maintained", True) and not is_gc:
         reasons.append("5日線<25日線")
     if rsi >= trail_cond.get("rsi_below", rsi_limit):
         reasons.append("RSI過熱")
@@ -78,123 +99,258 @@ def _should_exit_trailing(row, entry_price, cfg, held, hold_days):
 
     return bool(reasons), reasons
 
+# -----------------------------------------------------------------------
+# 単一トレードのシミュレーション
+# -----------------------------------------------------------------------
+
 def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
-    df = sig["df_ticker"]
-    idx = sig["entry_idx"]
+    df        = sig["df_ticker"]
+    idx       = sig["entry_idx"]
     stop_loss = bt_params["stop_loss_pct"] / 100
     hold_days = cfg.get("exit_rules", {}).get("hold_days", 10)
 
-    entry_row = df.iloc[idx]
+    entry_row   = df.iloc[idx]
     entry_price = _get_open(entry_row)
-    if entry_price <= 0: return None
+    if entry_price <= 0:
+        return None
 
+    exit_price, exit_date, exit_reason = None, None, None
     pending_exit = None
+
     for j in range(idx + 1, len(df)):
         curr_row = df.iloc[j]
-        if pending_exit:
-            exit_p = _get_open(curr_row)
-            return {
-                "ticker": sig["ticker"], "score": sig["score"], "signal_type": sig["signal_type"],
-                "entry_date": entry_row["date"], "entry_price": round(entry_price, 2),
-                "exit_date": curr_row["date"], "exit_price": round(exit_p, 2),
-                "pnl_pct": round(((exit_p - entry_price) / entry_price * 100), 2),
-                "pnl_yen": round((bt_params["initial_capital"] * bt_params["position_size"]) * ((exit_p - entry_price) / entry_price), 0),
-                "exit_reason": pending_exit, "held_days": (pd.to_datetime(curr_row["date"]) - pd.to_datetime(entry_row["date"])).days,
-            }
+        held     = j - idx
 
-        close_p = float(curr_row["price"])
-        if (close_p - entry_price) / entry_price * 100 <= -(stop_loss * 100):
+        # ① 前日に条件成立 → 本日始値で約定
+        if pending_exit is not None:
+            exit_price  = _get_open(curr_row)
+            exit_date   = curr_row["date"]
+            exit_reason = pending_exit
+            break
+
+        # ② 当日終値ベースで全手じまい条件を判定
+        close_price   = float(curr_row["price"])
+        pnl_pct_close = (close_price - entry_price) / entry_price * 100
+
+        sma_s_prev = float(df.iloc[j-1].get("sma_5",  0)) if j > 0 else 0
+        sma_l_prev = float(df.iloc[j-1].get("sma_25", 0)) if j > 0 else 0
+        sma_s_curr = float(curr_row.get("sma_5",  0))
+        sma_l_curr = float(curr_row.get("sma_25", 0))
+        rsi_curr   = float(curr_row.get("rsi_14", 50))
+        rsi_ob     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
+
+        is_dc = sma_s_prev >= sma_l_prev and sma_s_curr < sma_l_curr
+
+        if pnl_pct_close <= -(stop_loss * 100):
             pending_exit = "ストップロス"
-        elif float(df.iloc[j-1].get("sma_5",0)) >= float(df.iloc[j-1].get("sma_25",0)) and \
-             float(curr_row.get("sma_5",0)) < float(curr_row.get("sma_25",0)):
+        elif is_dc:
             pending_exit = "デッドクロス"
-        elif float(curr_row.get("rsi_14", 50)) >= cfg.get("exit_rules",{}).get("immediate",{}).get("rsi_overbought", 70):
+        elif rsi_curr >= rsi_ob:
             pending_exit = "RSI過熱"
         else:
-            triggered, reasons = _should_exit_trailing(curr_row, entry_price, cfg, j - idx, hold_days)
-            if triggered: pending_exit = f"トレーリング（{' / '.join(reasons)}）"
+            triggered, reasons = _should_exit_trailing(
+                curr_row, entry_price, cfg, held, hold_days
+            )
+            if triggered:
+                pending_exit = f"トレーリング手じまい（{' / '.join(reasons)}）"
 
-    last_row = df.iloc[-1]
+    if exit_price is None:
+        last_row    = df.iloc[-1]
+        exit_price  = _get_open(last_row)
+        exit_date   = last_row["date"]
+        exit_reason = pending_exit if pending_exit is not None else "データ末尾"
+
+    pnl_pct    = (exit_price - entry_price) / entry_price * 100
+    pnl_yen    = (bt_params["initial_capital"] * bt_params["position_size"]) * (pnl_pct / 100)
+    held_total = (pd.to_datetime(exit_date) - pd.to_datetime(entry_row["date"])).days
+
     return {
-        "ticker": sig["ticker"], "score": sig["score"], "signal_type": sig["signal_type"],
-        "entry_date": entry_row["date"], "entry_price": round(entry_price, 2),
-        "exit_date": last_row["date"], "exit_price": round(_get_open(last_row), 2),
-        "pnl_pct": round(((_get_open(last_row) - entry_price) / entry_price * 100), 2),
-        "pnl_yen": round((bt_params["initial_capital"] * bt_params["position_size"]) * ((_get_open(last_row) - entry_price) / entry_price), 0),
-        "exit_reason": pending_exit or "データ末尾", "held_days": (pd.to_datetime(last_row["date"]) - pd.to_datetime(entry_row["date"])).days,
+        "ticker":      sig["ticker"],
+        "score":       sig["score"],
+        "signal_type": sig["signal_type"],
+        "entry_date":  entry_row["date"],
+        "entry_price": round(entry_price, 2),
+        "exit_date":   exit_date,
+        "exit_price":  round(exit_price, 2),
+        "pnl_pct":     round(pnl_pct, 2),
+        "pnl_yen":     round(pnl_yen, 0),
+        "exit_reason": exit_reason,
+        "held_days":   held_total,
     }
 
 # -----------------------------------------------------------------------
-# 詳細集計・レポート (完全復元)
+# 集計・レポート
 # -----------------------------------------------------------------------
 
 def _calc_summary(trades: list[dict], bt_params: dict) -> dict:
-    if not trades: return {"total_trades": 0}
+    if not trades:
+        return {"total_trades": 0}
+
     df = pd.DataFrame(trades)
     df["score_bin"] = (df["score"] // 5) * 5
     df["exit_reason_normalized"] = df["exit_reason"].apply(_normalize_exit_reason)
 
-    def _get_stats(group):
-        wins = group[group["pnl_pct"] > 0]
-        gross_p = wins["pnl_yen"].sum()
-        gross_l = abs(group[group["pnl_pct"] <= 0]["pnl_yen"].sum()) or 1e-9
-        return {
-            "count": len(group),
-            "win_rate": round(len(wins) / len(group) * 100, 1),
+    # スコア帯別集計
+    score_stats = {}
+    for bin_val, group in df.groupby("score_bin"):
+        wins         = group[group["pnl_pct"] > 0]
+        losses       = group[group["pnl_pct"] <= 0]
+        gross_profit = wins["pnl_yen"].sum()
+        gross_loss   = abs(losses["pnl_yen"].sum()) or 1e-9
+        score_stats[bin_val] = {
+            "count":      len(group),
+            "win_rate":   round(len(wins) / len(group) * 100, 1),
             "avg_return": round(group["pnl_pct"].mean(), 2),
-            "avg_held": round(group["held_days"].mean(), 1),
-            "total_pnl": round(group["pnl_yen"].sum(), 0),
-            "pf": round(gross_p / gross_l, 2),
+            "avg_held":   round(group["held_days"].mean(), 1),
+            "pf":         round(gross_profit / gross_loss, 2),
         }
 
-    summary = {
-        "total_trades": len(df),
-        "win_rate": round(len(df[df["pnl_pct"] > 0]) / len(df) * 100, 1),
-        "avg_pnl_pct": round(df["pnl_pct"].mean(), 2),
-        "avg_held_days": round(df["held_days"].mean(), 1),
-        "total_pnl_yen": round(df["pnl_yen"].sum(), 0),
-        "profit_factor": _get_stats(df)["pf"],
-        "exit_counts": df["exit_reason_normalized"].value_counts().to_dict(),
-        "score_analysis": {int(b): _get_stats(g) for b, g in df.groupby("score_bin")},
-        "signal_analysis": {s: _get_stats(g) for s, g in df.groupby("signal_type")},
-        "cross_analysis": {(s, int(b)): _get_stats(g) for (s, b), g in df.groupby(["signal_type", "score_bin"])}
+    # シグナル種別集計
+    signal_stats = {}
+    for sig_type, group in df.groupby("signal_type"):
+        wins         = group[group["pnl_pct"] > 0]
+        losses       = group[group["pnl_pct"] <= 0]
+        gross_profit = wins["pnl_yen"].sum()
+        gross_loss   = abs(losses["pnl_yen"].sum()) or 1e-9
+        signal_stats[sig_type] = {
+            "count":      len(group),
+            "win_rate":   round(len(wins) / len(group) * 100, 1),
+            "avg_return": round(group["pnl_pct"].mean(), 2),
+            "avg_held":   round(group["held_days"].mean(), 1),
+            "total_pnl":  round(group["pnl_yen"].sum(), 0),
+            "pf":         round(gross_profit / gross_loss, 2),
+        }
+
+    # シグナル種別 × スコア帯 クロス集計
+    cross_stats = {}
+    for (sig_type, bin_val), group in df.groupby(["signal_type", "score_bin"]):
+        wins         = group[group["pnl_pct"] > 0]
+        losses       = group[group["pnl_pct"] <= 0]
+        gross_profit = wins["pnl_yen"].sum()
+        gross_loss   = abs(losses["pnl_yen"].sum()) or 1e-9
+        cross_stats[(sig_type, int(bin_val))] = {
+            "count":      len(group),
+            "win_rate":   round(len(wins) / len(group) * 100, 1),
+            "avg_return": round(group["pnl_pct"].mean(), 2),
+            "total_pnl":  round(group["pnl_yen"].sum(), 0),
+            "pf":         round(gross_profit / gross_loss, 2),
+        }
+
+    wins         = df[df["pnl_pct"] > 0]
+    losses       = df[df["pnl_pct"] <= 0]
+    gross_profit = wins["pnl_yen"].sum()
+    gross_loss   = abs(losses["pnl_yen"].sum()) or 1e-9
+    cumulative   = df["pnl_yen"].cumsum()
+    max_dd       = (cumulative - cumulative.cummax()).min()
+    exit_counts  = df["exit_reason_normalized"].value_counts().to_dict()
+
+    return {
+        "total_trades":     len(df),
+        "win_rate":         round(len(wins) / len(df) * 100, 1),
+        "avg_pnl_pct":      round(df["pnl_pct"].mean(), 2),
+        "avg_held_days":    round(df["held_days"].mean(), 1),
+        "total_pnl_yen":    round(df["pnl_yen"].sum(), 0),
+        "max_drawdown_pct": round(max_dd / bt_params["initial_capital"] * 100, 2),
+        "profit_factor":    round(gross_profit / gross_loss, 2),
+        "exit_counts":      exit_counts,
+        "score_analysis":   score_stats,
+        "signal_analysis":  signal_stats,
+        "cross_analysis":   cross_stats,
     }
-    return summary
 
 def _format_report_plain(summary: dict) -> str:
-    if not summary.get("total_trades"): return "📊 トレードなし"
-    
-    report = f"📊 **バックテスト結果(3年分・高速版)**\n"
-    report += f"総数: {summary['total_trades']}回 / 勝率: {summary['win_rate']}%\n"
-    report += f"平均損益: {summary['avg_pnl_pct']:+.2f}% / 合計: {summary['total_pnl_yen']:+,.0f}円\n"
-    report += f"PF: {summary['profit_factor']}\n\n"
+    if not summary.get("total_trades"):
+        return "📊 トレードなし"
 
-    report += "【スコア別分析】\n"
-    for b, v in sorted(summary["score_analysis"].items(), reverse=True):
-        report += f"  {b}-{b+4}点: {v['count']}回 | 勝率{v['win_rate']}% | 平均{v['avg_return']}% | PF:{v['pf']}\n"
+    exit_str = "\n【手じまい理由の内訳】\n"
+    for reason, count in sorted(
+        summary.get("exit_counts", {}).items(), key=lambda x: -x[1]
+    )[:10]:
+        exit_str += f"  {reason}: {count}回\n"
 
-    report += "\n【シグナル別分析】\n"
-    for s, v in sorted(summary["signal_analysis"].items(), key=lambda x: x[1]['total_pnl'], reverse=True):
-        report += f"  {s}: {v['count']}回 | 勝率{v['win_rate']}% | 合計{v['total_pnl']:+,.0f}円\n"
+    signal_str = "\n【シグナル種別分析】\n"
+    signal_str += "─" * 40 + "\n"
+    for sig_type, v in sorted(
+        summary.get("signal_analysis", {}).items(), key=lambda x: -x[1]["total_pnl"]
+    ):
+        signal_str += (
+            f"{sig_type}: {v['count']:>4}回 | 勝率{v['win_rate']:>5}% | "
+            f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | "
+            f"PF:{v['pf']:>4.2f} | 合計{v['total_pnl']:>+10,.0f}円\n"
+        )
 
-    return report
+    score_str = "\n【スコア別詳細分析（5点刻み）】\n"
+    score_str += "─" * 40 + "\n"
+    for bin_val, v in sorted(
+        summary.get("score_analysis", {}).items(), key=lambda x: x[0], reverse=True
+    ):
+        label = f"{bin_val:2.0f}-{bin_val+4.9:4.1f}点"
+        score_str += (
+            f"{label}: {v['count']:>3}回 | 勝率{v['win_rate']:>5}% | "
+            f"平均{v['avg_return']:>+6.2f}% | 保有{v['avg_held']:>5.1f}日 | PF:{v['pf']:>4.2f}\n"
+        )
+
+    cross_str = "\n【シグナル種別 × スコア帯 クロス集計】\n"
+    cross_data = summary.get("cross_analysis", {})
+
+    sig_types = sorted(set(k[0] for k in cross_data.keys()))
+    for sig_type in sig_types:
+        cross_str += f"\n▶ {sig_type}\n"
+        cross_str += f"  {'スコア帯':<12} | {'回数':>4} | {'勝率':>6} | {'平均損益':>8} | {'PF':>5} | {'合計':>10}\n"
+        cross_str += "  " + "─" * 58 + "\n"
+        bins = sorted(
+            [(k[1], v) for k, v in cross_data.items() if k[0] == sig_type],
+            key=lambda x: x[0], reverse=True
+        )
+        for bin_val, v in bins:
+            label = f"{bin_val:2.0f}-{bin_val+4.9:4.1f}点"
+            pf_str = f"{v['pf']:.2f}" if v['pf'] < 9999 else " ---"
+            cross_str += (
+                f"  {label:<12} | {v['count']:>4}回 | {v['win_rate']:>5}% | "
+                f"{v['avg_return']:>+7.2f}% | {pf_str:>5} | {v['total_pnl']:>+10,.0f}円\n"
+            )
+
+    return (
+        f"📊 **バックテスト結果(精鋭+始値統一+トレーリングモード)**\n"
+        f"総数: {summary['total_trades']}回 / 勝率: {summary['win_rate']}%\n"
+        f"平均損益: {summary['avg_pnl_pct']:+.2f}% / 平均保有: {summary['avg_held_days']:.1f}日\n"
+        f"合計: {summary['total_pnl_yen']:+,.0f}円\n"
+        f"PF: {summary['profit_factor']} / 最大DD: {summary['max_drawdown_pct']}%\n"
+        f"{exit_str}"
+        f"{signal_str}"
+        f"{score_str}"
+        f"{cross_str}"
+    )
 
 def _format_report_with_gemini(summary: dict, top_trades: list[dict]) -> str:
-    plain = _format_report_plain(summary)
     api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if not api_key: return plain
+    if not api_key:
+        return _format_report_plain(summary)
+    client = genai.Client(api_key=api_key)
+    prompt = (
+        "日本株バックテスト結果です。シグナル種別×スコア帯のクロス集計を含む結果として、"
+        "どのシグナル・スコア帯の組み合わせが優秀か、改善案を300字以内で要約してください。\n\n"
+        f"結果:\n{summary}\n\n上位トレード:\n{top_trades[:3]}"
+    )
     try:
-        client = genai.Client(api_key=api_key)
-        prompt = f"日本株バックテスト(3年)の結果です。改善案を200字で提案して:\n{summary}\n上位3件:{top_trades[:3]}"
-        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        return f"{plain}\n💡 **Gemini考察**\n{resp.text.strip()}"
-    except: return plain
+        response = client.models.generate_content(
+            model="gemini-2.0-flash", contents=prompt
+        )
+        gemini_text = response.text.strip()
+        return f"{_format_report_plain(summary)}\n\n💡 **Gemini考察**\n{gemini_text}"
+    except Exception as e:
+        print(f"⚠️ Gemini分析失敗: {e}")
+        return _format_report_plain(summary)
 
 def _send_discord(content: str):
+    if os.getenv("NOTIFY_DISCORD", "true").lower() == "false":
+        print("📭 Discord通知はスキップされました（NOTIFY_DISCORD=false）")
+        return
     url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-    if not url: return
-    for i in range(0, len(content), 1900):
-        requests.post(url, json={"content": content[i:i+1900]})
+    if not url:
+        return
+    for i in range(0, len(content), 1990):
+        requests.post(url, json={"content": content[i: i + 1990]})
 
 # -----------------------------------------------------------------------
 # メイン実行
@@ -202,66 +358,114 @@ def _send_discord(content: str):
 
 def run_backtest_and_report():
     start_time = datetime.now()
-    cfg = _load_config()
+    print(f"📊 バックテスト開始（始値統一・トレーリングモード）: {start_time.strftime('%H:%M:%S')}")
+
+    cfg       = _load_config()
     bt_params = _load_bt_params()
     min_score = float(bt_params.get("min_score", 55.0))
-    
-    db = DBManager()
+
+    print(f"  ストップロス: {bt_params['stop_loss_pct']}%")
+    print(f"  最小スコア: {min_score}点")
+    print(f"  最大日次エントリー: {bt_params['max_daily_entries']}件")
+
+    db     = DBManager()
     df_all = db.load_analysis_data(days=365 * 3)
-    if df_all.empty: return
+    if df_all.empty:
+        return
 
     niy_df = df_all[df_all["ticker"] == "NIY=F"].sort_values("date").copy()
     niy_df["m_change"] = niy_df["price"].pct_change() * 100
     crash_dates = set(niy_df[niy_df["m_change"] <= bt_params["market_crash_limit"]]["date"])
 
     all_signals = []
-    tickers = [t for t in df_all["ticker"].unique() if t != "NIY=F"]
-    min_days, stop_high_enabled = cfg.get("filter", {}).get("min_data_days", 80), cfg.get("filter", {}).get("stop_high", {}).get("enabled", True)
-    scoring_cfg, exclude_ranges = cfg.get("scoring_logic", {}), bt_params.get("exclude_score_ranges", [])
+    tickers     = [t for t in df_all["ticker"].unique() if t != "NIY=F"]
+    min_days    = cfg.get("filter", {}).get("min_data_days", 80)
+    stop_high_enabled = cfg.get("filter", {}).get("stop_high", {}).get("enabled", True)
+    scoring_cfg = cfg.get("scoring_logic", {})
 
-    print(f"🚀 バックテスト開始 (3年分 / {len(tickers)}銘柄)")
+    print(f"  解析対象銘柄数: {len(tickers)}")
 
     for ticker in tickers:
-        df_ticker = df_all[df_all["ticker"] == ticker].sort_values("date").reset_index(drop=True)
-        if len(df_ticker) < min_days: continue
+        df_ticker = (
+            df_all[df_all["ticker"] == ticker]
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        if len(df_ticker) < min_days:
+            continue
+
         df_ticker = _calculate_indicators(df_ticker)
-        
-        hits = scan_signals(df_ticker) # 高速一括スキャン
-        if not hits: continue
 
-        for hit in hits:
-            i = hit.get('index') or (df_ticker.index[df_ticker['date'] == hit['date']].tolist() or [None])[0]
-            if i is None or i < min_days or i >= len(df_ticker) - 1: continue
-
+        for i in range(min_days, len(df_ticker) - 1):
+            row_curr   = df_ticker.iloc[i]
             entry_date = df_ticker.iloc[i + 1]["date"]
-            if entry_date in crash_dates: continue
-            if stop_high_enabled and i >= 1 and _is_stop_high_internal(float(df_ticker.iloc[i]["price"]), float(df_ticker.iloc[i-1]["price"])): continue
 
-            score = calculate_score(pd.Series(hit), scoring_cfg)
-            if score < min_score or any(r[0] <= score < r[1] for r in exclude_ranges): continue
+            if entry_date in crash_dates:
+                continue
+
+            if stop_high_enabled and i >= 1:
+                if _is_stop_high(float(row_curr["price"]), float(df_ticker.iloc[i - 1]["price"])):
+                    continue
+
+            hits = _check_signals(ticker, df_ticker.iloc[: i + 1], cfg)
+            if not hits:
+                continue
+
+            score = calculate_score(pd.Series(hits[0]), scoring_cfg)
+
+            if score < min_score:
+                continue
+            # 除外スコア帯チェック
+            exclude_ranges = bt_params.get("exclude_score_ranges", [])
+            if any(r[0] <= score < r[1] for r in exclude_ranges):
+                continue
+
 
             all_signals.append({
-                "date": pd.to_datetime(entry_date), "ticker": ticker, "score": score,
-                "signal_type": hit.get("signal_type", "不明"), "df_ticker": df_ticker, "entry_idx": i + 1,
+                "date":        pd.to_datetime(entry_date),
+                "ticker":      ticker,
+                "score":       score,
+                "signal_type": hits[0]["signal_type"],
+                "df_ticker":   df_ticker,
+                "entry_idx":   i + 1,
             })
 
     if not all_signals:
-        print("シグナルなし"); return
+        print("シグナルが検出されませんでした。")
+        return
 
-    sig_df = pd.DataFrame(all_signals)
-    selected = sig_df.sort_values(["date", "score"], ascending=[True, False]).groupby("date").head(bt_params["max_daily_entries"])
+    sig_df   = pd.DataFrame(all_signals)
+    selected = (
+        sig_df
+        .sort_values(["date", "score"], ascending=[True, False])
+        .groupby("date")
+        .head(bt_params["max_daily_entries"])
+    )
 
     final_trades, free_dates = [], {}
+
     for _, sig in selected.iterrows():
-        if sig["ticker"] in free_dates and sig["date"] < pd.to_datetime(free_dates[sig["ticker"]]): continue
+        ticker = sig["ticker"]
+        if ticker in free_dates and sig["date"] < pd.to_datetime(free_dates[ticker]):
+            continue
+
         trade = _execute_trade(sig, bt_params, cfg)
         if trade:
-            final_trades.append(trade); free_dates[sig["ticker"]] = trade["exit_date"]
+            final_trades.append(trade)
+            free_dates[ticker] = trade["exit_date"]
 
-    summary = _calc_summary(final_trades, bt_params)
-    report = _format_report_with_gemini(summary, sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True))
-    _send_discord(report)
-    print(f"✅ 完了 (所要時間: {datetime.now() - start_time})")
+    if final_trades:
+        summary    = _calc_summary(final_trades, bt_params)
+        top_trades = sorted(final_trades, key=lambda x: x["pnl_pct"], reverse=True)
+        report     = _format_report_with_gemini(summary, top_trades)
+
+        _send_discord(f"📈 **精鋭バックテストレポート（始値統一・トレーリングモード）**\n{report}")
+        print(_format_report_plain(summary))
+    else:
+        print("有効なトレードがありませんでした。")
+
+    end_time = datetime.now()
+    print(f"📊 バックテスト完了。所要時間: {end_time - start_time}")
 
 if __name__ == "__main__":
     run_backtest_and_report()
