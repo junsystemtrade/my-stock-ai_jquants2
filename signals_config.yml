@@ -47,7 +47,7 @@ filter:
   market_breaker:
     enabled: true
     symbol: "NIY=F"
-    drop_threshold_pct: -1.5
+    drop_threshold_pct: -1.0
   stop_high:
     enabled: true
 
@@ -75,11 +75,11 @@ exit_rules:
   stop_loss_pct: 3.0
   immediate:
     dead_cross: true
-    rsi_overbought: 70
+    rsi_overbought: 75
   hold_days: 10
   trailing:
     enabled: true
-    early_activation_pct: 4.0
+    early_activation_pct: 3.0
     conditions:
       golden_cross_maintained: true
       rsi_below: 70
