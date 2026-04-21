@@ -1,5 +1,7 @@
+# =================================================================
 # signals_config.yml
 # 戦略: ゴールデンクロス特化・トレンド初動狙い（極・精鋭モード）
+# =================================================================
 
 signals:
   golden_cross:
@@ -13,16 +15,6 @@ signals:
       enabled: true
       min_pct: -5.0
       max_pct: 10.0
-
-  rsi_oversold:
-    enabled: false
-    window: 14
-    threshold: 40
-
-  volume_surge:
-    enabled: false
-    window: 20
-    multiplier: 3.0
 
 filter:
   min_price: 500
@@ -47,26 +39,26 @@ filter:
 scoring_logic:
   enabled: true
   weights:
-    volume_surge: 10
-    bias_proximity: 40
-    rsi_position: 30
-    liquidity_scale: 20
+    bias_proximity: 40    # 乖離率重視
+    rsi_position: 30      # RSI重視
+    liquidity_scale: 20   # 流動性重視
+    volume_surge: 10      # 出来高は補助
   parameters:
     volume_max_multiplier: 5.0
     volume_penalty_above: 8.0
     bias_limit_pct: 10.0
     bias_ideal_min: 0.5
-    bias_ideal_max: 4.0           # 5.0→4.0へ：上がりすぎを排除し初動に集中
+    bias_ideal_max: 4.0   # 初動に集中
     turnover_ideal_min: 3000000000
-    rsi_ideal_range: [45, 60]     # 45-65→45-60へ：過熱感をさらに先読み
+    rsi_ideal_range: [45, 60] # 過熱感を先読み
     rsi_penalty_above: 70
     ma25_upward_bonus: 0.0
 
 exit_rules:
-  stop_loss_pct: 4.0              # 3.0→4.0へ：ノイズによる損切りを回避
+  stop_loss_pct: 4.0      # ノイズ回避
   immediate:
     dead_cross: true
-    rsi_overbought: 80            # 75→80へ：トレンドをさらに深追い
+    rsi_overbought: 80    # トレンド深追い
   hold_days: 10
   trailing:
     enabled: true
@@ -77,11 +69,11 @@ exit_rules:
       profit_required: true
 
 backtest:
-  stop_loss_pct: 4.0              # 3.0→4.0へ整合
+  stop_loss_pct: 4.0
   initial_capital: 1000000
   position_size: 0.1
   max_daily_entries: 2
   market_crash_limit: -2.0
-  min_score: 70.0                 # 65→70へ：高精度な銘柄のみに限定
+  min_score: 70.0         # 70点以上の精鋭のみ
   exclude_score_ranges:
     - [95, 100]
