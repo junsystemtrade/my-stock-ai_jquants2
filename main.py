@@ -9,6 +9,7 @@ JPXマスターによる銘柄名取得・1銘柄1通知方式に対応。
   - STEP 2 で update_entry_prices() を呼び出し（前日ポジションの始値を更新）
   - STEP 8 で entry_price=None でポジション保存
     （6:30 時点では始値が未確定のため NULL 保存、翌日に始値を反映）
+  - 手じまい通知に銘柄名を追加
 """
 
 import os
@@ -180,7 +181,7 @@ def main():
     # ------------------------------------------------------------------
     print("\n--- STEP 4: 市場環境チェック ---")
     market_change, market_status = _get_market_condition()
-    crash_threshold = cfg.get("filter", {}).get("market_breaker", {}).get("drop_threshold_pct", -2.0)
+    crash_threshold = cfg["filter"].get("market_breaker", {}).get("drop_threshold_pct", -2.0)
     print(f"市場ステータス: {market_status} (NIY=F: {market_change:+.2f}%)")
 
     if market_change <= crash_threshold:
@@ -197,21 +198,24 @@ def main():
     # ------------------------------------------------------------------
     # STEP 5: 手じまいシグナルチェック
     # ------------------------------------------------------------------
+    print("\n--- STEP 5: 手じまいシグナルチェック ---")
+    _load_ticker_names()  # 銘柄名キャッシュを事前構築
     exit_signals = signal_engine.check_exit_signals(daily_data)
     if exit_signals:
         exit_report  = "🚨 **【手じまいシグナル】**\n"
         exit_report += "━" * 20 + "\n"
         for e in exit_signals:
-            pnl_str   = f"{e['pnl_pct']:+.2f}%"
-            pnl_emoji = "📈" if e["pnl_pct"] >= 0 else "📉"
+            pnl_str     = f"{e['pnl_pct']:+.2f}%"
+            pnl_emoji   = "📈" if e["pnl_pct"] >= 0 else "📉"
             code        = e["ticker"].replace(".T", "")
-          　company     = _get_company_name(code) or e["ticker"]
+            company     = _get_company_name(code) or e["ticker"]
             exit_report += (
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"**{e['ticker']}**\n"
+                f"**{company}**（{e['ticker']}）\n"
                 f"**理由**: {e['exit_reason']}\n"
-                f"**買値**: {int(e['entry_price']):,}円 -> **現値**: {int(e['current_price']):,}円\n"
+                f"**買値**: {int(e['entry_price']):,}円 → **現値**: {int(e['current_price']):,}円\n"
                 f"**損益**: {pnl_emoji} {pnl_str}\n"
+                f"**保有日数**: {e['held_days']}日\n"
                 f"**買いシグナル日**: {e['entry_date']}\n"
                 f"────────────────────\n"
             )
@@ -239,7 +243,6 @@ def main():
     # ------------------------------------------------------------------
     # STEP 7: Discord 通知（ヘッダー + 1銘柄1通知）
     # ------------------------------------------------------------------
-    _load_ticker_names()
     header = (
         f"🏛️ **【株式シグナル検知：厳選TOP3】**\n"
         f"📊 判定地合い: **{market_status}**\n"
@@ -256,7 +259,7 @@ def main():
         )
 
         # 前日比計算
-        df_ticker     = daily_data[daily_data["ticker"] == s["ticker"]].sort_values("date")
+        df_ticker       = daily_data[daily_data["ticker"] == s["ticker"]].sort_values("date")
         prev_change_str = "（取得不可）"
         if len(df_ticker) >= 2:
             latest_price    = float(df_ticker.iloc[-1]["price"])
@@ -269,7 +272,7 @@ def main():
         report = (
             f"**{i}/3銘柄目**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"**{name}** ({s['ticker']})\n"
+            f"**{name}**（{s['ticker']}）\n"
             f"**前日終値**: {int(s['price']):,}円  {prev_change_str}\n"
             f"**シグナル**: {s['signal_type']}\n"
             f"**根拠**: {s['reason']}\n"
