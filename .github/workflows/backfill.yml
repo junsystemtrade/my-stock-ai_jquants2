@@ -2,12 +2,10 @@
 # =====================================
 # データベースへ過去3年間の株価データを格納・更新するためのワークフロー
 name: Initial Backfill (3 Years)
-
 on:
   workflow_dispatch: # 手動実行用
   schedule:
     - cron: "0 21 28 * *"  # 毎月28日 JST 06:00（UTC 21:00）に自動実行
-
 jobs:
   backfill:
     name: Initial Backfill (3 Years)
@@ -22,7 +20,6 @@ jobs:
       YF_CHUNK_SIZE:       "50"
       YF_SLEEP_SEC:        "3.0"
       DB_CHUNK_SIZE:       "1000"
-
     steps:
       - name: 📥 リポジトリをチェックアウト
         uses: actions/checkout@v4
@@ -35,6 +32,13 @@ jobs:
 
       - name: 📦 依存ライブラリのインストール
         run: pip install -r requirements.txt
+
+      - name: 🛠️ DBマイグレーション（初回・カラム追加）
+        run: |
+          python - <<'EOF'
+          from database_manager import DBManager
+          DBManager().migrate()
+          EOF
 
       - name: 🚀 バックフィル処理を実行
         run: python portfolio_manager.py
