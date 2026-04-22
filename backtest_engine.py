@@ -15,6 +15,7 @@ RSI過熱の集計を正規化し、通知を2000文字以内に収める。
 - min_score 対応
 - max_daily_entries を YAML設定値から取得
 - シグナル種別×スコア帯のクロス集計を追加
+- 全パラメータをsignals_config.ymlから読み込むよう統一
 """
 
 import os
@@ -29,22 +30,27 @@ from signal_engine import _check_signals, _load_config, _is_stop_high, _calculat
 from scoring_system import calculate_score
 
 # -----------------------------------------------------------------------
-# バックテストパラメータ
+# バックテストパラメータ（signals_config.yml の backtest: + exit_rules: から読み込む）
 # -----------------------------------------------------------------------
 
-_DEFAULT_BT_PARAMS = {
-    "stop_loss_pct":       3.0,
-    "initial_capital":     1_000_000,
-    "position_size":       0.1,
-    "max_daily_entries":   2,
-    "market_crash_limit":  -2.0,
-    "min_score":           55.0,
-}
-
 def _load_bt_params() -> dict:
-    cfg = _load_config()
-    bt  = cfg.get("backtest", {})
-    return {**_DEFAULT_BT_PARAMS, **bt}
+    cfg        = _load_config()
+    bt         = cfg.get("backtest", {})
+    exit_rules = cfg.get("exit_rules", {})
+
+    # stop_loss_pct は backtest: を優先、なければ exit_rules: にフォールバック
+    stop_loss_pct = bt.get("stop_loss_pct", exit_rules.get("stop_loss_pct"))
+    if stop_loss_pct is None:
+        raise ValueError("signals_config.yml に stop_loss_pct が設定されていません（backtest: または exit_rules:）")
+
+    return {
+        "stop_loss_pct":      float(stop_loss_pct),
+        "initial_capital":    float(bt["initial_capital"]),
+        "position_size":      float(bt["position_size"]),
+        "max_daily_entries":  int(bt["max_daily_entries"]),
+        "market_crash_limit": float(bt["market_crash_limit"]),
+        "min_score":          float(bt["min_score"]),
+    }
 
 # -----------------------------------------------------------------------
 # 始値取得ヘルパー
@@ -76,7 +82,7 @@ def _should_exit_trailing(
 ) -> tuple[bool, list[str]]:
     trailing_cfg  = cfg.get("exit_rules", {}).get("trailing", {})
     trail_cond    = trailing_cfg.get("conditions", {})
-    rsi_limit     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
+    rsi_limit     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 80)
     early_act_pct = float(trailing_cfg.get("early_activation_pct", 999))
 
     current_price = float(row["price"])
@@ -137,7 +143,7 @@ def _execute_trade(sig: dict, bt_params: dict, cfg: dict) -> dict | None:
         sma_s_curr = float(curr_row.get("sma_5",  0))
         sma_l_curr = float(curr_row.get("sma_25", 0))
         rsi_curr   = float(curr_row.get("rsi_14", 50))
-        rsi_ob     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 70)
+        rsi_ob     = cfg.get("exit_rules", {}).get("immediate", {}).get("rsi_overbought", 80)
 
         is_dc = sma_s_prev >= sma_l_prev and sma_s_curr < sma_l_curr
 
@@ -362,7 +368,7 @@ def run_backtest_and_report():
 
     cfg       = _load_config()
     bt_params = _load_bt_params()
-    min_score = float(bt_params.get("min_score", 55.0))
+    min_score = bt_params["min_score"]
 
     print(f"  ストップロス: {bt_params['stop_loss_pct']}%")
     print(f"  最小スコア: {min_score}点")
@@ -415,11 +421,11 @@ def run_backtest_and_report():
 
             if score < min_score:
                 continue
+
             # 除外スコア帯チェック
             exclude_ranges = bt_params.get("exclude_score_ranges", [])
             if any(r[0] <= score < r[1] for r in exclude_ranges):
                 continue
-
 
             all_signals.append({
                 "date":        pd.to_datetime(entry_date),
