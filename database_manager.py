@@ -4,10 +4,10 @@ database_manager.py
 PostgreSQL（Supabase）との接続・データ操作を担当するモジュール。
 
 変更点:
-  - positions テーブルの id カラムを削除
-    既存テーブルは PRIMARY KEY (ticker, entry_date) のみのため
-  - load_open_positions() から id を除外
-  - entry_price NULL 許容・update_entry_prices() 追加は維持
+  - save_prices: ON CONFLICT DO NOTHING → DO UPDATE（open=NULLの行を上書き）
+  - load_analysis_data: days パラメータを CAST(INTEGER) で明示キャスト
+  - _ensure_table: 毎回実行されていたALTERを migrate() に切り出し
+    （初回セットアップ時のみ手動実行する）
 """
 
 import os
@@ -34,6 +34,7 @@ class DBManager:
         self._ensure_table()
 
     def _ensure_table(self):
+        """テーブルが存在しない場合のみ作成する。ALTERは含まない。"""
         check_prices    = text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'daily_prices');")
         check_positions = text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'positions');")
 
@@ -63,7 +64,6 @@ class DBManager:
                 print("OK daily_prices table created")
 
             if not exists_positions:
-                # id カラムなし・entry_price NULL 許容
                 ddl_pos = """
                 CREATE TABLE IF NOT EXISTS positions (
                     ticker       TEXT    NOT NULL,
@@ -84,29 +84,52 @@ class DBManager:
                     conn.execute(text("SET statement_timeout = '120s'"))
                     conn.execute(text(ddl_pos))
                 print("OK positions table created")
-            else:
-                # 既存テーブルのマイグレーション
-                with self.engine.begin() as conn:
-                    conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS exit_price NUMERIC;"))
-                    conn.execute(text("ALTER TABLE positions ALTER COLUMN entry_price DROP NOT NULL;"))
 
         except Exception as e:
             print(f"WARNING table check error (continuing): {e}")
+
+    def migrate(self):
+        """
+        初回セットアップ時のみ手動で呼び出すマイグレーション。
+        既存テーブルへのカラム追加・制約変更を行う。
+
+        実行方法:
+            from database_manager import DBManager
+            DBManager().migrate()
+        """
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS exit_price NUMERIC;"))
+                conn.execute(text("ALTER TABLE positions ALTER COLUMN entry_price DROP NOT NULL;"))
+            print("OK migration completed")
+        except Exception as e:
+            print(f"ERROR migration: {e}")
 
     # ------------------------------------------------------------------
     # 株価データ保存
     # ------------------------------------------------------------------
     def save_prices(self, df: pd.DataFrame):
+        """
+        株価データをDBに保存する。
+        同じ (ticker, date) が既に存在する場合、open が NULL であれば上書きする。
+        open が既に設定済みの行は更新しない（不要なI/Oを避ける）。
+        """
         if df.empty:
             print("WARNING: empty dataframe, skip save")
             return
 
-        required = ["ticker", "date", "open", "high", "low", "price", "volume"]
-        rows     = df[required].to_dict(orient="records")
+        required   = ["ticker", "date", "open", "high", "low", "price", "volume"]
+        rows       = df[required].to_dict(orient="records")
         insert_sql = text("""
             INSERT INTO daily_prices (ticker, date, open, high, low, price, volume)
             VALUES (:ticker, :date, :open, :high, :low, :price, :volume)
-            ON CONFLICT (ticker, date) DO NOTHING
+            ON CONFLICT (ticker, date) DO UPDATE
+                SET open   = EXCLUDED.open,
+                    high   = EXCLUDED.high,
+                    low    = EXCLUDED.low,
+                    price  = EXCLUDED.price,
+                    volume = EXCLUDED.volume
+                WHERE daily_prices.open IS NULL
         """)
         total = 0
         try:
@@ -147,7 +170,7 @@ class DBManager:
     # 翌日の始値を entry_price に更新
     # ------------------------------------------------------------------
     def update_entry_prices(self) -> int:
-        """entry_price が NULL のポジションに前日の始値を設定する"""
+        """entry_price が NULL のポジションに当日の始値を設定する"""
         update_sql = text("""
             UPDATE positions p
             SET entry_price = dp.open
@@ -167,7 +190,7 @@ class DBManager:
             return 0
 
     # ------------------------------------------------------------------
-    # ポジション一覧取得（id カラムなし）
+    # ポジション一覧取得
     # ------------------------------------------------------------------
     def load_open_positions(self) -> pd.DataFrame:
         sql = text("""
@@ -263,7 +286,7 @@ class DBManager:
             SELECT p.ticker, p.date, p.open, p.high, p.low, p.price, p.volume
             FROM daily_prices p
             CROSS JOIN latest l
-            WHERE p.date >= (l.max_date - (:days * INTERVAL '1 day'))
+            WHERE p.date >= (l.max_date - (CAST(:days AS INTEGER) * INTERVAL '1 day'))
             ORDER BY p.ticker, p.date ASC
         """)
         try:
