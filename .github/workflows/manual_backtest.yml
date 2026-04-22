@@ -2,9 +2,7 @@
 # =======================================
 # バックテストの手動実行 workflow
 # GitHub の Actions タブから手動でトリガーする
-
 name: Manual Backtest
-
 on:
   workflow_dispatch:
     inputs:
@@ -16,23 +14,19 @@ on:
         options:
           - "true"
           - "false"
-
 jobs:
   backtest:
     runs-on: ubuntu-latest
     # 無料枠の限界値である6時間（360分）に設定
     timeout-minutes: 360
-
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-      JQUANTS_API_KEY:     ${{ secrets.JQUANTS_API_KEY }}
       GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       NOTIFY_DISCORD:      ${{ github.event.inputs.notify_discord }}
       # Pythonのバッファリングを無効化し、ログをリアルタイムでActions画面に表示させる
       PYTHONUNBUFFERED: "1"
-
     steps:
       - name: ☁️ リポジトリをチェックアウト
         uses: actions/checkout@v4
@@ -46,8 +40,14 @@ jobs:
       - name: 📦 依存パッケージのインストール
         run: pip install -r requirements.txt
 
+      - name: 🛠️ DBマイグレーション（冪等・毎回安全）
+        run: |
+          python - <<'EOF'
+          from database_manager import DBManager
+          DBManager().migrate()
+          EOF
+
       - name: 📊 バックテスト実行
-        # 実行時の標準出力を維持
         run: python backtest_engine.py
 
       - name: 📝 最終ステータス通知（失敗時のみ）
