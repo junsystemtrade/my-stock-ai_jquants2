@@ -9,6 +9,8 @@ portfolio_manager.py
   「DBの最終日 >= 前営業日」の銘柄をスキップに変更
   → 毎日確実に最新データを取得できるようになる
 - sync_market_ticker() で NIY=F を毎回必ず取得
+- backfill_data() の除外条件を「データが存在する」→「min_data_days 以上ある」に変更
+  → 新規上場銘柄（DBデータが少ない銘柄）も月次バックフィルで自動補完される
 """
 
 import io
@@ -55,13 +57,11 @@ def get_target_tickers():
             excel_url = base_url + link["href"]
             resp      = requests.get(excel_url, headers=headers, timeout=30)
 
-            # xlsはxlrd、xlsxはopenpyxlで読み込む
             if excel_url.endswith(".xlsx"):
                 df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
             else:
                 df = pd.read_excel(io.BytesIO(resp.content), engine="xlrd")
 
-            # 整理・監理ポスト除外
             EXCLUDE_MARKETS = [
                 "整理（内国株式）",
                 "監理（内国株式）",
@@ -222,7 +222,6 @@ def sync_data():
     from sqlalchemy import text
     try:
         with db.engine.connect() as conn:
-            # 銘柄ごとの最終日を一括取得
             result = conn.execute(text("""
                 SELECT ticker, MAX(date) as latest_date
                 FROM daily_prices
@@ -264,11 +263,25 @@ def sync_data():
 # -------------------------------------------------------------------------
 
 def backfill_data():
-    """過去数年分のデータを一括取得（初回・追加用）"""
+    """
+    過去数年分のデータを一括取得（初回・追加用）。
+
+    除外条件を「DBに存在するか」から「min_data_days 以上データがあるか」に変更。
+    → 新規上場銘柄（DBデータが少ない銘柄）も月次バックフィルで自動補完される。
+    """
     db        = database_manager.DBManager()
     today     = _today_jst()
     start_str = (today - timedelta(days=BACKFILL_YEARS * 365)).strftime("%Y-%m-%d")
     end_str   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # signals_config.yml から min_data_days を取得
+    try:
+        from signal_engine import _load_config
+        cfg          = _load_config()
+        min_data_days = cfg["filter"]["min_data_days"]
+    except Exception:
+        min_data_days = 80
+    print(f"📋 min_data_days: {min_data_days}（これ未満の銘柄はバックフィル対象）")
 
     tickers = list(get_target_tickers().keys())
     if MARKET_TICKER not in tickers:
@@ -277,21 +290,29 @@ def backfill_data():
     from sqlalchemy import text
     try:
         with db.engine.connect() as conn:
-            existing = {
-                row[0] for row in conn.execute(
-                    text("SELECT ticker FROM daily_prices GROUP BY ticker")
-                )
-            }
+            # 銘柄ごとのデータ件数を取得
+            result = conn.execute(text("""
+                SELECT ticker, COUNT(*) as data_count
+                FROM daily_prices
+                GROUP BY ticker
+            """))
+            data_counts = {row[0]: row[1] for row in result}
     except Exception:
-        existing = set()
+        data_counts = {}
 
-    remaining = [t for t in tickers if t not in existing]
+    # min_data_days 未満の銘柄のみバックフィル対象
+    # （新規上場銘柄・データ不足銘柄を自動補完）
+    remaining = [
+        t for t in tickers
+        if data_counts.get(t, 0) < min_data_days
+    ]
 
     if not remaining:
-        print("✅ 全銘柄のバックフィルが完了しています。")
+        print(f"✅ 全銘柄のデータが {min_data_days} 件以上あります。バックフィルをスキップします。")
         return
 
-    print(f"🚀 バックフィル開始: 残り {len(remaining)} 銘柄")
+    print(f"🚀 バックフィル開始: 対象 {len(remaining)} 銘柄 / 全 {len(tickers)} 銘柄")
+    print(f"   （うち新規上場・データ不足: {sum(1 for t in remaining if data_counts.get(t, 0) > 0)} 銘柄が部分データあり）")
 
     chunk_size = 20
     for i in range(0, len(remaining), chunk_size):
