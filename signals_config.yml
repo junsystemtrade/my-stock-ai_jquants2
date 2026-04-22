@@ -85,4 +85,7 @@ backtest:
   position_size: 0.1
   max_daily_entries: 2
   market_crash_limit: -2.0
-  min_score: 55.0               # この点数未満のシグナルはバックテストでも除外
+  min_score: 60.0               # 変更: 55.0 → 60.0（55-59点帯はPF 0.81のため除外）
+  exclude_score_ranges:
+    - [80, 85]                  # PF 0.85：スコア高いが成績悪い帯
+    - [95, 100]                 # PF 0.23：過熱・出来高急増で逆に危険
