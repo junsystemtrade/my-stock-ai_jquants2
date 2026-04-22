@@ -3,6 +3,11 @@ signal_engine.py
 ================
 テクニカルシグナルの計算と、スコアリングに必要な環境指標の付与を担当。
 
+【設計方針】
+- すべての設定値は signals_config.yml で一元管理する
+- _load_config() はYAMLを読むだけ。フォールバック辞書は持たない
+- YAMLが存在しない場合は FileNotFoundError で即気づける
+
 変更点:
   - ゴールデンクロスに追加条件を実装
     ① require_ma25_upward: 25日線が上向きの時のみ
@@ -25,35 +30,13 @@ _CONFIG_PATH = Path(__file__).parent / "signals_config.yml"
 
 
 def _load_config() -> dict:
-    if _CONFIG_PATH.exists():
-        with open(_CONFIG_PATH, encoding="utf-8") as f:
-            return yaml.safe_load(f)
-    return {
-        "signals": {
-            "golden_cross": {
-                "enabled": True, "short_window": 5, "long_window": 25,
-                "require_ma25_upward": True,
-                "volume_confirm": True, "volume_confirm_ratio": 1.2,
-                "bias_range": {"enabled": True, "min_pct": -5.0, "max_pct": 10.0},
-            },
-            "rsi_oversold":  {"enabled": False, "window": 14, "threshold": 40},
-            "volume_surge":  {"enabled": False, "window": 20, "multiplier": 3.0},
-        },
-        "filter": {
-            "min_price": 500, "max_price": 50000,
-            "min_data_days": 80,
-            "min_daily_turnover_avg_20": 500000000,
-            "exclude_code_range": [[1000, 1999]],
-            "require_above_ma25": True,
-        },
-        "exit_rules": {
-            "immediate": {"dead_cross": True, "rsi_overbought": 70},
-            "hold_days": 10,
-            "trailing": {"enabled": True, "conditions": {
-                "golden_cross_maintained": True, "rsi_below": 70, "profit_required": True,
-            }}
-        }
-    }
+    if not _CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"設定ファイルが見つかりません: {_CONFIG_PATH}\n"
+            "signals_config.yml を配置してください。"
+        )
+    with open(_CONFIG_PATH, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 def _today_jst():
@@ -158,7 +141,7 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
         return []
 
     df       = _calculate_indicators(df)
-    min_days = cfg["filter"].get("min_data_days", 80)
+    min_days = cfg["filter"]["min_data_days"]
     if len(df) < min_days:
         return []
 
@@ -167,13 +150,13 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     price    = float(row["price"])
 
     # ストップ高チェック
-    stop_high_cfg = cfg.get("filter", {}).get("stop_high", {})
+    stop_high_cfg = cfg["filter"].get("stop_high", {})
     if stop_high_cfg.get("enabled", True) and prev_row is not None:
         if _is_stop_high(price, float(prev_row["price"])):
             return []
 
     # 売買代金フィルター
-    min_turnover = cfg["filter"].get("min_daily_turnover_avg_20", 500000000)
+    min_turnover = cfg["filter"]["min_daily_turnover_avg_20"]
     if row["turnover_avg_20"] < min_turnover:
         return []
 
@@ -186,8 +169,8 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
         if not bool(row.get("is_above_ma25", False)):
             return []
 
-    res      = []
-    signals  = cfg.get("signals", {})
+    res     = []
+    signals = cfg["signals"]
 
     # ---- ① ゴールデンクロス ----
     gc_cfg = signals.get("golden_cross", {})
@@ -219,9 +202,9 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
             if not skip:
                 bias_cfg = gc_cfg.get("bias_range", {})
                 if bias_cfg.get("enabled", False):
-                    bias = float(row.get("mavg_25_diff", 0))
-                    b_min = bias_cfg.get("min_pct", -5.0)
-                    b_max = bias_cfg.get("max_pct", 10.0)
+                    bias  = float(row.get("mavg_25_diff", 0))
+                    b_min = bias_cfg["min_pct"]
+                    b_max = bias_cfg["max_pct"]
                     if not (b_min <= bias <= b_max):
                         skip = True
 
@@ -235,7 +218,7 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     # ---- ② RSI売られすぎ ----
     rsi_cfg = signals.get("rsi_oversold", {})
     if rsi_cfg.get("enabled", False):
-        if row["rsi_14"] < rsi_cfg.get("threshold", 40):
+        if row["rsi_14"] < rsi_cfg["threshold"]:
             res.append({
                 "signal_type": "RSI中立以下",
                 "reason":      f"RSI: {row['rsi_14']:.1f}",
@@ -245,15 +228,12 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
     # ---- ③ 出来高急増 ----
     vol_cfg = signals.get("volume_surge", {})
     if vol_cfg.get("enabled", False):
-        if row["volume_ratio"] >= vol_cfg.get("multiplier", 3.0):
-            # RSI範囲チェック
+        if row["volume_ratio"] >= vol_cfg["multiplier"]:
             if vol_cfg.get("require_rsi_range", False):
-                rsi    = float(row.get("rsi_14", 50))
-                r_min  = vol_cfg.get("rsi_min", 40)
-                r_max  = vol_cfg.get("rsi_max", 65)
-                if not (r_min <= rsi <= r_max):
-                    pass
-                else:
+                rsi   = float(row.get("rsi_14", 50))
+                r_min = vol_cfg["rsi_min"]
+                r_max = vol_cfg["rsi_max"]
+                if r_min <= rsi <= r_max:
                     res.append({
                         "signal_type": "出来高急増",
                         "reason":      f"出来高 {row['volume_ratio']:.1f}倍",
@@ -279,13 +259,13 @@ def _check_signals(ticker: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
 # -----------------------------------------------------------------------
 def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
     cfg            = _load_config()
-    exit_cfg       = cfg.get("exit_rules", {})
-    immediate_cfg  = exit_cfg.get("immediate", {})
-    hold_days      = exit_cfg.get("hold_days", 10)
-    trailing_cfg   = exit_cfg.get("trailing", {})
-    trailing_on    = trailing_cfg.get("enabled", True)
-    trail_cond     = trailing_cfg.get("conditions", {})
-    rsi_overbought = immediate_cfg.get("rsi_overbought", 70)
+    exit_cfg       = cfg["exit_rules"]
+    immediate_cfg  = exit_cfg["immediate"]
+    hold_days      = exit_cfg["hold_days"]
+    trailing_cfg   = exit_cfg["trailing"]
+    trailing_on    = trailing_cfg["enabled"]
+    trail_cond     = trailing_cfg["conditions"]
+    rsi_overbought = immediate_cfg["rsi_overbought"]
 
     db             = database_manager.DBManager()
     open_positions = db.load_open_positions()
@@ -316,10 +296,10 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
         pnl_pct       = (current_price - entry_price) / entry_price * 100
         held_days     = (pd.to_datetime(today).date() - entry_date).days
 
-        sma_s       = df_ticker["sma_5"]
-        sma_l       = df_ticker["sma_25"]
-        is_gc       = sma_s.iloc[-1] > sma_l.iloc[-1]
-        is_dc       = (
+        sma_s = df_ticker["sma_5"]
+        sma_l = df_ticker["sma_25"]
+        is_gc = sma_s.iloc[-1] > sma_l.iloc[-1]
+        is_dc = (
             len(sma_s) > 1
             and sma_s.iloc[-2] >= sma_l.iloc[-2]
             and sma_s.iloc[-1] < sma_l.iloc[-1]
@@ -337,7 +317,7 @@ def check_exit_signals(daily_data: pd.DataFrame) -> list[dict]:
                 reasons = []
                 if trail_cond.get("golden_cross_maintained", True) and not is_gc:
                     reasons.append("5日線<25日線")
-                if rsi >= trail_cond.get("rsi_below", 70):
+                if rsi >= trail_cond["rsi_below"]:
                     reasons.append(f"RSI過熱({rsi:.1f})")
                 if trail_cond.get("profit_required", True) and pnl_pct <= 0:
                     reasons.append("含み損転落")
@@ -380,9 +360,9 @@ def scan_signals(daily_data: pd.DataFrame, market_status: str = None) -> list[di
     if market_status is None:
         market_status = market_status_actual
 
-    breaker_cfg = cfg.get("filter", {}).get("market_breaker", {})
+    breaker_cfg = cfg["filter"].get("market_breaker", {})
     if breaker_cfg.get("enabled", False):
-        threshold = breaker_cfg.get("drop_threshold_pct", -1.5)
+        threshold = breaker_cfg["drop_threshold_pct"]
         if market_change <= threshold:
             print(f"WARNING market_breaker: {market_change:+.2f}% -> skip scan")
             return []
