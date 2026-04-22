@@ -204,6 +204,8 @@ def main():
         for e in exit_signals:
             pnl_str   = f"{e['pnl_pct']:+.2f}%"
             pnl_emoji = "📈" if e["pnl_pct"] >= 0 else "📉"
+            code        = e["ticker"].replace(".T", "")
+          　company     = _get_company_name(code) or e["ticker"]
             exit_report += (
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"**{e['ticker']}**\n"
