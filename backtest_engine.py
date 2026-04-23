@@ -50,6 +50,7 @@ def _load_bt_params() -> dict:
         "max_daily_entries":  int(bt["max_daily_entries"]),
         "market_crash_limit": float(bt["market_crash_limit"]),
         "min_score":          float(bt["min_score"]),
+        "exclude_score_ranges": bt.get("exclude_score_ranges", []),
     }
 
 # -----------------------------------------------------------------------
