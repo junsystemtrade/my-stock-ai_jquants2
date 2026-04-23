@@ -1,4 +1,4 @@
-"""
+ """
 main.py
 
 クォータ対策 (429 RESOURCE_EXHAUSTED) を強化した最新安定版。
@@ -11,7 +11,7 @@ JPXマスターによる銘柄名取得・1銘柄1通知方式に対応。
 - STEP 8 で entry_price=None でポジション保存
   （6:30 時点では始値が未確定のため NULL 保存、翌日に始値を反映）
 - 手じまい通知に銘柄名を追加
-“””
+ “””
 
 import os
 import time
