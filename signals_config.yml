@@ -66,7 +66,7 @@ scoring_logic:
     ma25_upward_bonus: 0.0      # 現状は使わない（require_ma25_upwardで代替）
 
 exit_rules:
-  stop_loss_pct: 4.0            # ストップロス（本番・バックテスト共通）
+  stop_loss_pct: 3.5            # ストップロス（本番・バックテスト共通）
   immediate:
     dead_cross: true
     rsi_overbought: 80          # 初期保有中：トレンド形成を邪魔しない
@@ -80,7 +80,7 @@ exit_rules:
       profit_required: true
 
 backtest:
-  stop_loss_pct: 4.0            # exit_rules.stop_loss_pctと必ず一致させること
+  stop_loss_pct: 3.5            # exit_rules.stop_loss_pctと必ず一致させること
   initial_capital: 1000000
   position_size: 0.1
   max_daily_entries: 2
