@@ -59,33 +59,33 @@ scoring_logic:
     volume_penalty_above: 8.0
     bias_limit_pct: 10.0
     bias_ideal_min: 0.5
-    bias_ideal_max: 4.0   # 初動に集中（5%超は過熱気味）
+    bias_ideal_max: 4.0
     turnover_ideal_min: 3000000000
-    rsi_ideal_range: [45, 60]   # 過熱感を先読みして早めに評価下げ
-    rsi_penalty_above: 70       # これ以上はスコア0
-    ma25_upward_bonus: 0.0      # 現状は使わない（require_ma25_upwardで代替）
+    rsi_ideal_range: [45, 60]
+    rsi_penalty_above: 70
+    ma25_upward_bonus: 0.0
 
 exit_rules:
-  stop_loss_pct: 4.5            # ストップロス（本番・バックテスト共通）
+  stop_loss_pct: 4.5
   immediate:
     dead_cross: true
     rsi_overbought: 80          # 初期保有中：トレンド形成を邪魔しない
   hold_days: 10
   trailing:
     enabled: true
-    early_activation_pct: 3.0  # 含み益3%超で保有10日前でもトレーリング発動
+    early_activation_pct: 3.0
     conditions:
       golden_cross_maintained: true
-      rsi_below: 70             # 保有延長中：成熟トレンドは早めに利確
+      rsi_below: 75             # 変更: 70→75（トレンドをもう少し伸ばす）
       profit_required: true
 
 backtest:
-  stop_loss_pct: 4.5            # exit_rules.stop_loss_pctと必ず一致させること
+  stop_loss_pct: 4.5
   initial_capital: 1000000
   position_size: 0.1
   max_daily_entries: 2
   market_crash_limit: -2.0
-  min_score: 60.0               # 変更: 55.0 → 60.0（55-59点帯はPF 0.81のため除外）
+  min_score: 60.0
   exclude_score_ranges:
-    - [80, 85]                  # PF 0.85：スコア高いが成績悪い帯
-    - [95, 100]                 # PF 0.23：過熱・出来高急増で逆に危険
+    - [80, 85]
+    - [95, 100]
