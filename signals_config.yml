@@ -1,0 +1,88 @@
+# =================================================================
+# signals_config.yml
+# 戦略: ゴールデンクロス特化・トレンド初動狙い（極・精鋭モード）
+#
+# ※ すべての設定値はこのファイルで一元管理する。
+#    各Pythonファイルはこのファイルを読み込むだけで動作する。
+# =================================================================
+
+signals:
+  golden_cross:
+    enabled: true
+    short_window: 5
+    long_window: 25
+    require_ma25_upward: true
+    volume_confirm: true
+    volume_confirm_ratio: 1.2
+    bias_range:
+      enabled: true
+      min_pct: -5.0
+      max_pct: 10.0
+  rsi_oversold:
+    enabled: false
+    window: 14
+    threshold: 40
+  volume_surge:
+    enabled: false
+    window: 20
+    multiplier: 3.0
+
+filter:
+  min_price: 500
+  max_price: 50000
+  min_data_days: 80
+  exclude_code_range:
+    - [1300, 1699]
+    - [2000, 2099]
+    - [2500, 2639]
+    - [2840, 2859]
+    - [8950, 8999]
+  min_daily_turnover_avg_20: 500000000
+  max_signals_per_ticker: 1
+  require_above_ma25: true
+  market_breaker:
+    enabled: true
+    symbol: "NIY=F"
+    drop_threshold_pct: -1.0
+  stop_high:
+    enabled: true
+
+scoring_logic:
+  enabled: true
+  weights:
+    bias_proximity: 40    # 乖離率重視（初動の位置感）
+    rsi_position: 30      # RSI重視（過熱感の先読み）
+    liquidity_scale: 20   # 流動性重視
+    volume_surge: 10      # 出来高は補助指標
+  parameters:
+    volume_max_multiplier: 5.0
+    volume_penalty_above: 8.0
+    bias_limit_pct: 10.0
+    bias_ideal_min: 0.5
+    bias_ideal_max: 4.0   # 初動に集中（5%超は過熱気味）
+    turnover_ideal_min: 3000000000
+    rsi_ideal_range: [45, 60]   # 過熱感を先読みして早めに評価下げ
+    rsi_penalty_above: 70       # これ以上はスコア0
+    ma25_upward_bonus: 0.0      # 現状は使わない（require_ma25_upwardで代替）
+
+exit_rules:
+  stop_loss_pct: 4.5            # ストップロス（本番・バックテスト共通）
+  immediate:
+    dead_cross: true
+    rsi_overbought: 80          # 初期保有中：トレンド形成を邪魔しない
+  hold_days: 10
+  trailing:
+    enabled: true
+    early_activation_pct: 3.0  # 含み益3%超で保有10日前でもトレーリング発動
+    conditions:
+      golden_cross_maintained: true
+      rsi_below: 70             # 保有延長中：成熟トレンドは早めに利確
+      profit_required: true
+
+backtest:
+  stop_loss_pct: 4.5            # exit_rules.stop_loss_pctと必ず一致させること
+  initial_capital: 1000000
+  position_size: 0.1
+  max_daily_entries: 2
+  market_crash_limit: -2.0
+  min_score: 55.0               # ①リセット: exclude_score_rangesも削除してベースライン再計測
