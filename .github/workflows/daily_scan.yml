@@ -12,16 +12,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90         # Gemini 429リトライ考慮（3銘柄 × 最大60秒 + バッファ）
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       DATABASE_URL:        ${{ secrets.DATABASE_URL }}
       GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
     steps:
       - name: ☁️ リポジトリをチェックアウト
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 🐍 Python セットアップ
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
