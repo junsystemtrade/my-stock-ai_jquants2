@@ -1,4 +1,4 @@
-“””
+"""
 main.py
 
 クォータ対策 (429 RESOURCE_EXHAUSTED) を強化した最新安定版。
