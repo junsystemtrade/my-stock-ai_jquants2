@@ -50,10 +50,11 @@ filter:
 scoring_logic:
   enabled: true
   weights:
-    bias_proximity: 40    # 乖離率重視（初動の位置感）
-    rsi_position: 30      # RSI重視（過熱感の先読み）
-    liquidity_scale: 20   # 流動性重視
-    volume_surge: 10      # 出来高は補助指標
+    bias_proximity: 30   # 下げる（乖離大きすぎ銘柄を弾く）
+    rsi_position:   40   # 上げる（RSI理想ゾーンをより重視）
+    liquidity_scale: 20  # 維持
+    volume_surge:   10   # 維持
+    
   parameters:
     volume_max_multiplier: 5.0
     volume_penalty_above: 8.0
