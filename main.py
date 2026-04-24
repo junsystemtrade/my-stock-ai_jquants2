@@ -177,28 +177,11 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # STEP 4: 市場環境チェック
     # ------------------------------------------------------------------
-    print("\n--- STEP 4: 市場環境チェック ---")
-    market_change, market_status = _get_market_condition()
-    crash_threshold = cfg["filter"].get("market_breaker", {}).get("drop_threshold_pct", -2.0)
-    print(f"市場ステータス: {market_status} (NIY=F: {market_change:+.2f}%)")
-
-    if market_change <= crash_threshold:
-        msg = (
-            f"📉 **【市場警戒：スキャン停止】**\n"
-            f"日経平均先物が大幅下落（{market_change:+.2f}%）のためスキャンを中止しました。\n"
-        )
-        print(msg)
-        send_discord(msg)
-        return
-
-    print("✅ 市場環境良好。スキャンを継続します。")
-
     # ------------------------------------------------------------------
-    # STEP 5: 手じまいシグナルチェック
+    # STEP 4: 手じまいシグナルチェック（市場ブレーカーに関係なく必ず実行）
     # ------------------------------------------------------------------
-    print("\n--- STEP 5: 手じまいシグナルチェック ---")
+    print("\n--- STEP 4: 手じまいシグナルチェック ---")
     _load_ticker_names()  # 銘柄名キャッシュを事前構築
     exit_signals = signal_engine.check_exit_signals(daily_data)
     if exit_signals:
@@ -219,6 +202,25 @@ def main():
                 f"────────────────────\n"
             )
         send_discord(exit_report)
+
+    # ------------------------------------------------------------------
+    # STEP 5: 市場環境チェック（ブレーカー発動時は買いシグナルのみ停止）
+    # ------------------------------------------------------------------
+    print("\n--- STEP 5: 市場環境チェック ---")
+    market_change, market_status = _get_market_condition()
+    crash_threshold = cfg["filter"].get("market_breaker", {}).get("drop_threshold_pct", -2.0)
+    print(f"市場ステータス: {market_status} (NIY=F: {market_change:+.2f}%)")
+
+    if market_change <= crash_threshold:
+        msg = (
+            f"📉 **【市場警戒：買いスキャン停止】**\n"
+            f"日経平均先物が大幅下落（{market_change:+.2f}%）のため買いスキャンを中止しました。\n"
+        )
+        print(msg)
+        send_discord(msg)
+        return
+
+    print("✅ 市場環境良好。スキャンを継続します。")
 
     # ------------------------------------------------------------------
     # STEP 6: 買いシグナルスキャン & スコアリング
