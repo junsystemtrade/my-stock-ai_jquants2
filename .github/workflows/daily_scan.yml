@@ -4,8 +4,6 @@
 # 平日 06:30 JST（= UTC 21:30 前日）に自動実行
 name: Daily Stock Scan
 on:
-  schedule:
-    - cron: "30 21 * * 0-4"   # UTC 21:30 = JST 06:30（日〜木 → 月〜金実行）
   workflow_dispatch:            # 手動実行も可能
 jobs:
   scan:
