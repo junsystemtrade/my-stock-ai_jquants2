@@ -4,8 +4,6 @@
 name: Initial Backfill (3 Years)
 on:
   workflow_dispatch: # 手動実行用
-  schedule:
-    - cron: "0 21 28 * *"  # 毎月28日 JST 06:00（UTC 21:00）に自動実行
 jobs:
   backfill:
     name: Initial Backfill (3 Years)
