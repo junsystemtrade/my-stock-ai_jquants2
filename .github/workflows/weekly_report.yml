@@ -3,8 +3,6 @@
 # 毎週土曜日 JST 08:00 に週次トレード成績レポートを通知
 name: Weekly Trade Report
 on:
-  schedule:
-    - cron: "0 23 * * 5"  # UTC 23:00 金曜 = JST 08:00 土曜
   workflow_dispatch:       # 手動実行も可能
 jobs:
   report:
