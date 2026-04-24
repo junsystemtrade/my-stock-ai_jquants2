@@ -47,16 +47,25 @@ def _today_jst():
 # 地合い判定
 # -----------------------------------------------------------------------
 def _get_market_condition() -> tuple[float, str]:
-    db    = database_manager.DBManager()
-    query = text("SELECT price FROM daily_prices WHERE ticker = 'NIY=F' ORDER BY date DESC LIMIT 2")
+    db = database_manager.DBManager()
+    # 当日データは取引時間中に不完全な場合があるため、前営業日以前の直近2件を使用する
+    today_jst = _today_jst()
+    query = text("""
+        SELECT date, price FROM daily_prices
+        WHERE ticker = 'NIY=F'
+          AND date < :today
+        ORDER BY date DESC
+        LIMIT 2
+    """)
     try:
         with db.engine.connect() as conn:
-            df_niy = pd.read_sql(query, conn)
+            df_niy = pd.read_sql(query, conn, params={"today": today_jst})
         if len(df_niy) < 2:
             return 0.0, "不明"
         p_now    = float(df_niy["price"].iloc[0])
         p_prev   = float(df_niy["price"].iloc[1])
         m_change = (p_now - p_prev) / p_prev * 100
+        print(f"INFO NIY=F: {df_niy['date'].iloc[0]} {p_now:,.0f} vs {df_niy['date'].iloc[1]} {p_prev:,.0f}")
         if m_change <= -2.0:    status = "暴落警戒"
         elif m_change <= -0.5:  status = "軟調"
         elif m_change >= 0.5:   status = "好調"
